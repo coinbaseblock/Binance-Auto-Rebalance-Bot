@@ -1,0 +1,20 @@
+# WSL2 Configuration Template for Docker Desktop
+# Copy this file to: %USERPROFILE%\.wslconfig (e.g., C:\Users\YourName\.wslconfig)
+# Then restart WSL: wsl --shutdown
+# And restart Docker Desktop
+
+[wsl2]
+# Limit memory to prevent OCI runtime errors during Docker builds
+memory=4GB
+
+# Limit processors
+processors=2
+
+# Swap space
+swap=2GB
+
+# Disable page reporting so WSL retains all allocated memory
+pageReporting=false
+
+# Turn off default connection to bind WSL2 localhost to Windows localhost
+localhostforwarding=true

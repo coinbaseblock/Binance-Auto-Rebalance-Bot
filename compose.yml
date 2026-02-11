@@ -1,0 +1,114 @@
+name: binance-rebalance-bot
+
+services:
+  # Web Dashboard - Real-time monitoring UI
+  dashboard:
+    build: .
+    ports:
+      - "${DASHBOARD_PORT:-5000}:5000"
+    environment:
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_API_SECRET=${BINANCE_API_SECRET}
+      - BINANCE_TESTNET=${BINANCE_TESTNET:-true}
+      - TOTAL_CAPITAL_USDT=${TOTAL_CAPITAL_USDT:-10000}
+      - MAX_ALLOCATION_PER_COIN=${MAX_ALLOCATION_PER_COIN:-0.20}
+      - STOP_LOSS_PERCENT=${STOP_LOSS_PERCENT:-25}
+      - MAX_CONCURRENT_STRATEGIES=${MAX_CONCURRENT_STRATEGIES:-5}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./charts_output:/app/charts_output
+      - ./config:/app/config:ro
+    restart: unless-stopped
+    command: ["python", "main.py", "--mode", "dashboard", "--port", "5000"]
+
+  # Demo Dashboard - Sample data for testing
+  dashboard-demo:
+    build: .
+    ports:
+      - "${DEMO_PORT:-5001}:5000"
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./logs:/app/logs
+      - ./charts_output:/app/charts_output
+    restart: unless-stopped
+    profiles:
+      - demo
+    command: ["python", "main.py", "--mode", "dashboard", "--demo", "--port", "5000"]
+
+  # Paper Trading Bot - Simulated trading with testnet
+  paper:
+    build: .
+    environment:
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_API_SECRET=${BINANCE_API_SECRET}
+      - BINANCE_TESTNET=true
+      - TOTAL_CAPITAL_USDT=${TOTAL_CAPITAL_USDT:-10000}
+      - MAX_ALLOCATION_PER_COIN=${MAX_ALLOCATION_PER_COIN:-0.20}
+      - STOP_LOSS_PERCENT=${STOP_LOSS_PERCENT:-25}
+      - MAX_CONCURRENT_STRATEGIES=${MAX_CONCURRENT_STRATEGIES:-5}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./charts_output:/app/charts_output
+      - ./config:/app/config:ro
+    restart: unless-stopped
+    profiles:
+      - paper
+    command: ["python", "main.py", "--mode", "paper", "--strategies", "all"]
+
+  # Live Trading Bot - Real money trading (USE WITH CAUTION!)
+  live:
+    build: .
+    environment:
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_API_SECRET=${BINANCE_API_SECRET}
+      - BINANCE_TESTNET=false
+      - TOTAL_CAPITAL_USDT=${TOTAL_CAPITAL_USDT:-10000}
+      - MAX_ALLOCATION_PER_COIN=${MAX_ALLOCATION_PER_COIN:-0.20}
+      - STOP_LOSS_PERCENT=${STOP_LOSS_PERCENT:-25}
+      - MAX_CONCURRENT_STRATEGIES=${MAX_CONCURRENT_STRATEGIES:-5}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./charts_output:/app/charts_output
+      - ./config:/app/config:ro
+    restart: unless-stopped
+    profiles:
+      - live
+    command: ["python", "main.py", "--mode", "live", "--strategies", "all"]
+
+  # DCR Live Trading - Single coin DCR/USDT trading
+  dcr-live:
+    build: .
+    container_name: binance-dcr-live
+    env_file:
+      - .env
+    environment:
+      - BINANCE_TESTNET=false
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./charts_output:/app/charts_output
+    restart: unless-stopped
+    profiles:
+      - dcr
+    command: ["python", "main.py", "--mode", "live", "--symbol", "DCR/USDT"]
+
+  # DCR Simulation - Test DCR ladder strategy
+  dcr-simulation:
+    build: .
+    container_name: binance-dcr-simulation
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./charts_output:/app/charts_output
+    profiles:
+      - dcr-sim
+    command: ["python", "simulate_dcr_ladders.py"]

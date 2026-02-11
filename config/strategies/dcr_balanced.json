@@ -1,0 +1,43 @@
+{
+  "enabled": true,
+  "name": "DCR Balanced",
+  "pair": "DCRUSDT",
+  "description": "Balanced strategy for Decred (DCR) - Initial: 100 DCR + 1000 USDT",
+
+  "wallet": {
+    "initial_dcr": 100,
+    "initial_usdt": 1000,
+    "entry_price": 19.04
+  },
+
+  "ladder_config": {
+    "base_gap": 0.034,
+    "gap_max": 0.95,
+    "ladders": 13,
+    "fibonacci": [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233],
+    "unit_size_dcr": 5.0
+  },
+
+  "capital_allocation": {
+    "max_allocation_percent": 0.35,
+    "reserve_percent": 0.10
+  },
+
+  "risk_management": {
+    "safety_multiplier": 1.5,
+    "stop_loss_percent": -0.50,
+    "take_profit_percent": 0.25
+  },
+
+  "execution": {
+    "auto_rebalance": true,
+    "rebalance_interval_hours": 12,
+    "min_profit_to_close": 0.005
+  },
+
+  "order_placement": {
+    "mode": "sequential",
+    "proximity_percent": 0.015,
+    "delay_seconds": 45
+  }
+}

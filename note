@@ -1,0 +1,47 @@
+# 1. Build
+docker build -t binance-dcr-bot .
+
+# 2. รัน DCR Live
+docker-compose up dcr-live
+
+# หรือรันแบบ background
+docker-compose up -d dcr-live
+
+# 3. ดู logs
+docker logs -f binance-dcr-live
+
+
+คำสั่งอื่นๆ ที่มีประโยชน์
+การทำงาน	คำสั่ง
+รัน Simulation	docker-compose --profile simulation up dcr-simulation
+รัน Dashboard	docker-compose --profile dashboard up dashboard
+หยุด Bot	docker-compose down
+ดูสถานะ	docker ps
+Restart	docker restart dcr-live
+
+
+# Project-specific cleanup
+docker-compose down --volumes --remove-orphans
+docker image rm binance-dcr-bot
+
+# Full system cleanup (optional)
+docker system prune -a --volumes
+
+
+docker run -d --name binance-bot -p 5000:5000 --env-file .env binance-dcr-bot
+
+
+build-docker.bat
+
+docker stop binance-bot && docker rm binance-bot
+
+docker run -d --name binance-bot -p 5000:5000 --env-file .env binance-dcr-bot
+
+docker run --name binance-bot -p 5000:5000 --env-file .env binance-dcr-bot
+
+
+docker run --name binance-bot -p 5000:5000 --env-file .env binance-dcr-bot python main.py --mode dashboard --port 5000 --strategies dcr_balanced
+
+--mode live
+
+docker run --name binance-bot -p 5000:5000 --env-file .env binance-dcr-bot python main.py --mode live --port 5000 --strategies dcr_balanced

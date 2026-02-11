@@ -1,0 +1,30 @@
+{
+  "enabled": true,
+  "name": "BTC Conservative",
+  "pair": "BTCUSDT",
+  "description": "Low risk strategy for BTC with wide gaps",
+
+  "ladder_config": {
+    "base_gap": 0.01,
+    "ladders": 6,
+    "fibonacci": [1, 1, 2, 3, 5, 8],
+    "unit_size_btc": 0.01
+  },
+
+  "capital_allocation": {
+    "max_allocation_percent": 0.20,
+    "reserve_percent": 0.10
+  },
+
+  "risk_management": {
+    "safety_multiplier": 1.5,
+    "stop_loss_percent": -0.25,
+    "take_profit_percent": 0.20
+  },
+
+  "execution": {
+    "auto_rebalance": true,
+    "rebalance_interval_hours": 24,
+    "min_profit_to_close": 0.005
+  }
+}

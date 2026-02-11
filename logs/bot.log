@@ -1,0 +1,16 @@
+2026-02-11 05:06:26,094 - __main__ - INFO - === DASHBOARD MODE ===
+2026-02-11 05:06:26,849 - __main__ - INFO - Connecting to live trading system...
+2026-02-11 05:06:27,047 - src.binance_client - INFO - Binance client initialized (testnet=False)
+2026-02-11 05:06:27,202 - __main__ - INFO - Available capital: $2507.43 USDT
+2026-02-11 05:06:27,213 - src.strategy - INFO - Loaded strategy: BNB Aggressive
+2026-02-11 05:06:27,214 - src.strategy - INFO - Calculated 10 ladders with total swing: 61.96%
+2026-02-11 05:06:27,220 - src.strategy - INFO - Loaded strategy: BTC Conservative
+2026-02-11 05:06:27,221 - src.strategy - INFO - Calculated 6 ladders with total swing: 18.57%
+2026-02-11 05:06:27,227 - src.strategy - INFO - Loaded strategy: DCR Balanced
+2026-02-11 05:06:27,228 - src.strategy - INFO - Calculated 13 ladders with total swing: 100.00%
+2026-02-11 05:06:27,233 - src.strategy - INFO - Loaded strategy: ETH Balanced
+2026-02-11 05:06:27,233 - src.strategy - INFO - Calculated 8 ladders with total swing: 34.75%
+2026-02-11 05:06:27,238 - src.strategy - INFO - Loaded strategy: ZEC Balanced
+2026-02-11 05:06:27,238 - src.strategy - INFO - Calculated 13 ladders with total swing: 100.00%
+2026-02-11 05:06:27,238 - __main__ - INFO - Loaded 5 strategies
+2026-02-11 05:06:27,778 - src.web_dashboard - INFO - Dashboard starting at http://0.0.0.0:5000

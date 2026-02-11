@@ -1,0 +1,24 @@
+{
+  "version": "1.0.0",
+  "exchange": "binance",
+  "base_currency": "USDT",
+  "fee": {
+    "maker": 0.001,
+    "taker": 0.001
+  },
+  "order": {
+    "min_order_usdt": 15,
+    "order_timeout_seconds": 30,
+    "retry_attempts": 3
+  },
+  "risk_management": {
+    "max_drawdown_percent": 30,
+    "position_size_limit_percent": 25,
+    "emergency_stop_loss": -40
+  },
+  "monitoring": {
+    "check_interval_seconds": 60,
+    "price_update_interval": 5,
+    "rebalance_on_startup": true
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "enabled": true,
+  "name": "BNB Aggressive",
+  "pair": "BNBUSDT",
+  "description": "High risk strategy for BNB with tight gaps",
+
+  "ladder_config": {
+    "base_gap": 0.006,
+    "ladders": 10,
+    "fibonacci": [1, 1, 2, 3, 5, 8, 13, 21, 34, 55],
+    "unit_size_bnb": 0.1
+  },
+
+  "capital_allocation": {
+    "max_allocation_percent": 0.15,
+    "reserve_percent": 0.15
+  },
+
+  "risk_management": {
+    "safety_multiplier": 2.0,
+    "stop_loss_percent": -0.30,
+    "take_profit_percent": 0.35
+  },
+
+  "execution": {
+    "auto_rebalance": true,
+    "rebalance_interval_hours": 12,
+    "min_profit_to_close": 0.01
+  }
+}

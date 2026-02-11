@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Binance Auto Rebalance Bot - Live Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.socket.io/4.6.0/socket.io.min.js"></script>
+    <style>
+        :root {
+            --bg-dark: #0d1117;
+            --bg-card: #161b22;
+            --border-color: #30363d;
+            --text-primary: #c9d1d9;
+            --text-secondary: #8b949e;
+            --accent-green: #3fb950;
+            --accent-red: #f85149;
+            --accent-blue: #58a6ff;
+            --accent-yellow: #d29922;
+        }
+
+        body {
+            background-color: var(--bg-dark);
+            color: var(--text-primary);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+
+        .navbar {
+            background-color: var(--bg-card);
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .card {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+        }
+
+        .card-header {
+            background-color: rgba(255, 255, 255, 0.05);
+            border-bottom: 1px solid var(--border-color);
+            font-weight: 600;
+        }
+
+        .stat-card {
+            padding: 1rem;
+            border-radius: 8px;
+            background: linear-gradient(135deg, var(--bg-card), rgba(88, 166, 255, 0.1));
+            border: 1px solid var(--border-color);
+        }
+
+        .stat-value {
+            font-size: 1.75rem;
+            font-weight: 700;
+        }
+
+        .stat-label {
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .positive { color: var(--accent-green); }
+        .negative { color: var(--accent-red); }
+
+        .table {
+            color: var(--text-primary);
+        }
+
+        .table thead th {
+            border-bottom: 2px solid var(--border-color);
+            color: var(--text-secondary);
+            font-weight: 600;
+            font-size: 0.85rem;
+            text-transform: uppercase;
+        }
+
+        .table td {
+            border-color: var(--border-color);
+            vertical-align: middle;
+        }
+
+        .badge-buy {
+            background-color: var(--accent-green);
+            color: #000;
+        }
+
+        .badge-sell {
+            background-color: var(--accent-red);
+            color: #fff;
+        }
+
+        .status-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 8px;
+        }
+
+        .status-connected { background-color: var(--accent-green); }
+        .status-disconnected { background-color: var(--accent-red); }
+
+        .price-ticker {
+            font-family: 'Courier New', monospace;
+            font-size: 1.1rem;
+        }
+
+        .price-change-up {
+            animation: flash-green 0.5s;
+        }
+
+        .price-change-down {
+            animation: flash-red 0.5s;
+        }
+
+        @keyframes flash-green {
+            0%, 100% { background-color: transparent; }
+            50% { background-color: rgba(63, 185, 80, 0.3); }
+        }
+
+        @keyframes flash-red {
+            0%, 100% { background-color: transparent; }
+            50% { background-color: rgba(248, 81, 73, 0.3); }
+        }
+
+        .activity-log {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .log-entry {
+            padding: 0.5rem;
+            border-bottom: 1px solid var(--border-color);
+            font-size: 0.9rem;
+        }
+
+        .log-entry:last-child {
+            border-bottom: none;
+        }
+
+        .log-time {
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+        }
+
+        #pnlChart, #equityChart {
+            max-height: 250px;
+        }
+
+        .spinner-border-sm {
+            width: 1rem;
+            height: 1rem;
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-dark px-4">
+        <div class="d-flex align-items-center">
+            <i class="bi bi-robot text-primary me-2" style="font-size: 1.5rem;"></i>
+            <span class="navbar-brand mb-0 h1">Binance Auto Rebalance Bot</span>
+        </div>
+        <div class="d-flex align-items-center">
+            <span id="connectionStatus">
+                <span class="status-indicator status-disconnected"></span>
+                <span class="text-secondary">Connecting...</span>
+            </span>
+            <span class="ms-4 text-secondary">
+                <i class="bi bi-clock me-1"></i>
+                <span id="lastUpdate">--:--:--</span>
+            </span>
+        </div>
+    </nav>
+
+    <div class="container-fluid py-4">
+        <!-- Portfolio Summary Row -->
+        <div class="row g-3 mb-4">
+            <div class="col-md-3">
+                <div class="stat-card">
+                    <div class="stat-label">Portfolio Value</div>
+                    <div class="stat-value" id="portfolioValue">$0.00</div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="stat-card">
+                    <div class="stat-label">Total P&L</div>
+                    <div class="stat-value" id="totalPnl">$0.00</div>
+                </div>
+            </div>
+            <div class="col-md-2">
+                <div class="stat-card">
+                    <div class="stat-label">ROI</div>
+                    <div class="stat-value" id="roiPercent">0.00%</div>
+                </div>
+            </div>
+            <div class="col-md-2">
+                <div class="stat-card">
+                    <div class="stat-label">Open Positions</div>
+                    <div class="stat-value" id="openPositions">0</div>
+                </div>
+            </div>
+            <div class="col-md-2">
+                <div class="stat-card">
+                    <div class="stat-label">Total Trades</div>
+                    <div class="stat-value" id="totalTrades">0</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Price Tickers and Capital -->
+        <div class="row g-3 mb-4">
+            <div class="col-md-8">
+                <div class="card h-100">
+                    <div class="card-header">
+                        <i class="bi bi-graph-up me-2"></i>Live Prices
+                    </div>
+                    <div class="card-body">
+                        <div class="row" id="priceTickers">
+                            <div class="col text-center text-secondary">Loading prices...</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="card h-100">
+                    <div class="card-header">
+                        <i class="bi bi-wallet2 me-2"></i>Capital Allocation
+                    </div>
+                    <div class="card-body">
+                        <div class="d-flex justify-content-between mb-2">
+                            <span>Free Capital</span>
+                            <span class="positive" id="capitalFree">$0.00</span>
+                        </div>
+                        <div class="d-flex justify-content-between mb-3">
+                            <span>Allocated</span>
+                            <span class="text-warning" id="capitalAllocated">$0.00</span>
+                        </div>
+                        <div class="progress" style="height: 8px; background-color: var(--border-color);">
+                            <div class="progress-bar bg-success" id="capitalProgress" style="width: 70%"></div>
+                            <div class="progress-bar bg-warning" id="allocatedProgress" style="width: 30%"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Charts Row -->
+        <div class="row g-3 mb-4">
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header">
+                        <i class="bi bi-bar-chart-line me-2"></i>P&L History
+                    </div>
+                    <div class="card-body">
+                        <canvas id="pnlChart"></canvas>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header">
+                        <i class="bi bi-graph-up-arrow me-2"></i>Equity Curve
+                    </div>
+                    <div class="card-body">
+                        <canvas id="equityChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Orders and Trades Row -->
+        <div class="row g-3 mb-4">
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span><i class="bi bi-list-ul me-2"></i>Active Orders</span>
+                        <span class="badge bg-primary" id="ordersCount">0</span>
+                    </div>
+                    <div class="card-body p-0">
+                        <div class="table-responsive">
+                            <table class="table table-sm mb-0">
+                                <thead>
+                                    <tr>
+                                        <th>Type</th>
+                                        <th>Symbol</th>
+                                        <th>Price</th>
+                                        <th>Qty</th>
+                                        <th>Level</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="ordersTable">
+                                    <tr><td colspan="5" class="text-center text-secondary">No active orders</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span><i class="bi bi-clock-history me-2"></i>Recent Trades</span>
+                        <span class="badge bg-success" id="tradesCount">0</span>
+                    </div>
+                    <div class="card-body p-0">
+                        <div class="table-responsive">
+                            <table class="table table-sm mb-0">
+                                <thead>
+                                    <tr>
+                                        <th>Strategy</th>
+                                        <th>Level</th>
+                                        <th>Buy</th>
+                                        <th>Sell</th>
+                                        <th>Profit</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="tradesTable">
+                                    <tr><td colspan="5" class="text-center text-secondary">No trades yet</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Strategies and Activity Log -->
+        <div class="row g-3">
+            <div class="col-md-4">
+                <div class="card">
+                    <div class="card-header">
+                        <i class="bi bi-gear me-2"></i>Active Strategies
+                    </div>
+                    <div class="card-body p-0">
+                        <div id="strategiesList" class="list-group list-group-flush">
+                            <div class="list-group-item text-secondary text-center" style="background: transparent; border-color: var(--border-color);">No strategies loaded</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-8">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span><i class="bi bi-activity me-2"></i>Activity Log</span>
+                        <button class="btn btn-sm btn-outline-secondary" onclick="clearLogs()">Clear</button>
+                    </div>
+                    <div class="card-body p-0">
+                        <div class="activity-log" id="activityLog">
+                            <div class="log-entry text-secondary text-center">Waiting for activity...</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Initialize Socket.IO connection
+        const socket = io();
+
+        // Charts
+        let pnlChart, equityChart;
+        const maxDataPoints = 50;
+        const pnlData = [];
+        const equityData = [];
+        const labels = [];
+
+        // Previous prices for change detection
+        let previousPrices = {};
+
+        // Initialize charts
+        function initCharts() {
+            const chartOptions = {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false }
+                },
+                scales: {
+                    x: {
+                        display: false
+                    },
+                    y: {
+                        grid: { color: 'rgba(255,255,255,0.1)' },
+                        ticks: { color: '#8b949e' }
+                    }
+                }
+            };
+
+            // P&L Chart
+            pnlChart = new Chart(document.getElementById('pnlChart'), {
+                type: 'bar',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        data: [],
+                        backgroundColor: [],
+                        borderRadius: 4
+                    }]
+                },
+                options: chartOptions
+            });
+
+            // Equity Chart
+            equityChart = new Chart(document.getElementById('equityChart'), {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        data: [],
+                        borderColor: '#58a6ff',
+                        backgroundColor: 'rgba(88, 166, 255, 0.1)',
+                        fill: true,
+                        tension: 0.4
+                    }]
+                },
+                options: chartOptions
+            });
+        }
+
+        // Update connection status
+        function updateConnectionStatus(connected) {
+            const statusEl = document.getElementById('connectionStatus');
+            if (connected) {
+                statusEl.innerHTML = '<span class="status-indicator status-connected"></span><span class="text-success">Connected</span>';
+            } else {
+                statusEl.innerHTML = '<span class="status-indicator status-disconnected"></span><span class="text-danger">Disconnected</span>';
+            }
+        }
+
+        // Update last update time
+        function updateLastUpdate() {
+            const now = new Date();
+            document.getElementById('lastUpdate').textContent = now.toLocaleTimeString();
+        }
+
+        // Format currency
+        function formatCurrency(value) {
+            return '$' + value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+
+        // Update price tickers
+        function updatePriceTickers(prices) {
+            const container = document.getElementById('priceTickers');
+            if (!prices || Object.keys(prices).length === 0) {
+                container.innerHTML = '<div class="col text-center text-secondary">No price data</div>';
+                return;
+            }
+
+            let html = '';
+            for (const [symbol, price] of Object.entries(prices)) {
+                const prevPrice = previousPrices[symbol] || price;
+                const changeClass = price > prevPrice ? 'price-change-up' : price < prevPrice ? 'price-change-down' : '';
+                const changeIcon = price > prevPrice ? 'bi-caret-up-fill text-success' : price < prevPrice ? 'bi-caret-down-fill text-danger' : '';
+
+                html += `
+                    <div class="col-md-3 text-center mb-2">
+                        <div class="text-secondary small">${symbol}</div>
+                        <div class="price-ticker ${changeClass}">
+                            ${formatCurrency(price)}
+                            ${changeIcon ? `<i class="bi ${changeIcon} ms-1"></i>` : ''}
+                        </div>
+                    </div>
+                `;
+            }
+            container.innerHTML = html;
+            previousPrices = { ...prices };
+        }
+
+        // Update portfolio stats
+        function updatePortfolioStats(portfolio) {
+            if (!portfolio) return;
+
+            document.getElementById('portfolioValue').textContent = formatCurrency(portfolio.total_value);
+
+            const pnlEl = document.getElementById('totalPnl');
+            pnlEl.textContent = formatCurrency(portfolio.total_pnl);
+            pnlEl.className = 'stat-value ' + (portfolio.total_pnl >= 0 ? 'positive' : 'negative');
+
+            const roiEl = document.getElementById('roiPercent');
+            roiEl.textContent = portfolio.roi_percent.toFixed(2) + '%';
+            roiEl.className = 'stat-value ' + (portfolio.roi_percent >= 0 ? 'positive' : 'negative');
+
+            document.getElementById('openPositions').textContent = portfolio.num_open_positions;
+            document.getElementById('totalTrades').textContent = portfolio.num_trades;
+
+            document.getElementById('capitalFree').textContent = formatCurrency(portfolio.capital_free);
+            document.getElementById('capitalAllocated').textContent = formatCurrency(portfolio.capital_allocated);
+
+            // Update progress bar
+            const total = portfolio.capital_free + portfolio.capital_allocated;
+            const freePercent = (portfolio.capital_free / total) * 100;
+            document.getElementById('capitalProgress').style.width = freePercent + '%';
+            document.getElementById('allocatedProgress').style.width = (100 - freePercent) + '%';
+
+            // Update equity chart
+            const now = new Date().toLocaleTimeString();
+            equityData.push(portfolio.total_value);
+            labels.push(now);
+            if (equityData.length > maxDataPoints) {
+                equityData.shift();
+                labels.shift();
+            }
+            equityChart.data.labels = labels;
+            equityChart.data.datasets[0].data = equityData;
+            equityChart.update('none');
+        }
+
+        // Update orders table
+        function updateOrdersTable(orders) {
+            const tbody = document.getElementById('ordersTable');
+            document.getElementById('ordersCount').textContent = orders.length;
+
+            if (orders.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="text-center text-secondary">No active orders</td></tr>';
+                return;
+            }
+
+            let html = '';
+            for (const order of orders) {
+                const badgeClass = order.type === 'BUY' ? 'badge-buy' : 'badge-sell';
+                html += `
+                    <tr>
+                        <td><span class="badge ${badgeClass}">${order.type}</span></td>
+                        <td>${order.symbol}</td>
+                        <td>${formatCurrency(order.price)}</td>
+                        <td>${order.quantity.toFixed(6)}</td>
+                        <td>${order.level}</td>
+                    </tr>
+                `;
+            }
+            tbody.innerHTML = html;
+        }
+
+        // Update trades table
+        function updateTradesTable(trades) {
+            const tbody = document.getElementById('tradesTable');
+            document.getElementById('tradesCount').textContent = trades.length;
+
+            if (trades.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="text-center text-secondary">No trades yet</td></tr>';
+                return;
+            }
+
+            let html = '';
+            for (const trade of trades.slice().reverse()) {
+                const profitClass = trade.profit >= 0 ? 'positive' : 'negative';
+                html += `
+                    <tr>
+                        <td>${trade.strategy}</td>
+                        <td>${trade.level}</td>
+                        <td>${formatCurrency(trade.buy_price)}</td>
+                        <td>${formatCurrency(trade.sell_price)}</td>
+                        <td class="${profitClass}">${formatCurrency(trade.profit)}</td>
+                    </tr>
+                `;
+            }
+            tbody.innerHTML = html;
+
+            // Update P&L chart
+            const recentTrades = trades.slice(-maxDataPoints);
+            pnlChart.data.labels = recentTrades.map((_, i) => i + 1);
+            pnlChart.data.datasets[0].data = recentTrades.map(t => t.profit);
+            pnlChart.data.datasets[0].backgroundColor = recentTrades.map(t => t.profit >= 0 ? '#3fb950' : '#f85149');
+            pnlChart.update('none');
+        }
+
+        // Update strategies list
+        function updateStrategiesList(strategies) {
+            const container = document.getElementById('strategiesList');
+            if (strategies.length === 0) {
+                container.innerHTML = '<div class="list-group-item text-secondary text-center" style="background: transparent; border-color: var(--border-color);">No strategies loaded</div>';
+                return;
+            }
+
+            let html = '';
+            for (const strategy of strategies) {
+                html += `
+                    <div class="list-group-item d-flex justify-content-between align-items-center" style="background: transparent; border-color: var(--border-color);">
+                        <div>
+                            <strong>${strategy.name}</strong>
+                            <div class="small text-secondary">${strategy.pair}</div>
+                        </div>
+                        <div class="text-end">
+                            <div class="small">${strategy.num_ladders} ladders</div>
+                            <div class="small text-secondary">${strategy.base_gap_percent}% gap</div>
+                        </div>
+                    </div>
+                `;
+            }
+            container.innerHTML = html;
+        }
+
+        // Add log entry
+        function addLogEntry(message, type = 'info') {
+            const log = document.getElementById('activityLog');
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+
+            const typeColors = {
+                'info': 'text-info',
+                'success': 'positive',
+                'error': 'negative',
+                'warning': 'text-warning'
+            };
+
+            entry.innerHTML = `
+                <span class="log-time">${new Date().toLocaleTimeString()}</span>
+                <span class="${typeColors[type] || ''} ms-2">${message}</span>
+            `;
+
+            // Remove "waiting" message if present
+            if (log.querySelector('.text-center')) {
+                log.innerHTML = '';
+            }
+
+            log.insertBefore(entry, log.firstChild);
+
+            // Keep only last 100 entries
+            while (log.children.length > 100) {
+                log.removeChild(log.lastChild);
+            }
+        }
+
+        // Clear logs
+        function clearLogs() {
+            document.getElementById('activityLog').innerHTML = '<div class="log-entry text-secondary text-center">Logs cleared</div>';
+        }
+
+        // Socket.IO event handlers
+        socket.on('connect', () => {
+            updateConnectionStatus(true);
+            addLogEntry('Connected to trading bot', 'success');
+        });
+
+        socket.on('disconnect', () => {
+            updateConnectionStatus(false);
+            addLogEntry('Disconnected from trading bot', 'error');
+        });
+
+        socket.on('status_update', (data) => {
+            updateLastUpdate();
+            updatePriceTickers(data.prices);
+            updatePortfolioStats(data.portfolio);
+            updateOrdersTable(data.active_orders);
+            updateTradesTable(data.recent_trades);
+            updateStrategiesList(data.strategies);
+        });
+
+        socket.on('price_update', (data) => {
+            updatePriceTickers(data.prices);
+            updateLastUpdate();
+        });
+
+        socket.on('new_trade', (data) => {
+            const trade = data.trade;
+            const profitStr = trade.profit >= 0 ? `+${formatCurrency(trade.profit)}` : formatCurrency(trade.profit);
+            addLogEntry(`Trade closed: ${trade.strategy} Level ${trade.level} - ${profitStr}`, trade.profit >= 0 ? 'success' : 'error');
+        });
+
+        socket.on('order_placed', (data) => {
+            const order = data.order;
+            addLogEntry(`Order placed: ${order.type} ${order.symbol} @ ${formatCurrency(order.price)}`, 'info');
+        });
+
+        socket.on('order_filled', (data) => {
+            const order = data.order;
+            addLogEntry(`Order filled: ${order.type} ${order.symbol} @ ${formatCurrency(order.price)}`, 'success');
+        });
+
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', () => {
+            initCharts();
+            addLogEntry('Dashboard initialized', 'info');
+        });
+
+        // Request update every 5 seconds as fallback
+        setInterval(() => {
+            socket.emit('request_update');
+        }, 5000);
+    </script>
+</body>
+</html>

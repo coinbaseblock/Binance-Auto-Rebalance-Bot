@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  dcr-live:
+    build: .
+    container_name: binance-dcr-live
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./charts_output:/app/charts_output
+    command: python main.py --mode live --symbol DCR/USDT
+    restart: unless-stopped
+
+  dcr-simulation:
+    build: .
+    container_name: binance-dcr-simulation
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./charts_output:/app/charts_output
+    command: python simulate_dcr_ladders.py
+    profiles:
+      - simulation
+
+  dashboard:
+    build: .
+    container_name: binance-dashboard
+    env_file:
+      - .env
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./charts_output:/app/charts_output
+    command: python main.py --mode dashboard --port 5000
+    restart: unless-stopped
+    profiles:
+      - dashboard
