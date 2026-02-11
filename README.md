@@ -178,6 +178,36 @@ docker logs -f binance-dcr-live
 | Restart Bot | `docker restart binance-dcr-live` |
 | View Logs | `docker logs -f binance-dcr-live` |
 
+### Docker: Fix `container name is already in use`
+
+หากเจอ error นี้:
+
+```text
+docker: Error response from daemon: Conflict. The container name "/binance-bot" is already in use...
+```
+
+หมายความว่าเคยมี container ชื่อนี้อยู่แล้ว (แม้จะ `Exited` ไปแล้วก็ตาม) ให้เลือกวิธีใดวิธีหนึ่ง:
+
+```bash
+# 1) Start container เดิมที่มีอยู่แล้ว
+docker start binance-bot
+
+# 2) ลบ container เดิม แล้ว run ใหม่ด้วยชื่อเดิม
+docker rm binance-bot
+docker run --name binance-bot -p 5000:5000 --env-file .env binance-dcr-bot python main.py --mode live --port 5000 --strategies dcr_balanced zec_balanced
+
+# 3) ใช้ชื่อใหม่ไปเลย (ถ้าต้องการรันคนละ instance)
+docker run --name binance-bot-2 -p 5000:5000 --env-file .env binance-dcr-bot python main.py --mode live --port 5000 --strategies dcr_balanced zec_balanced
+```
+
+ตรวจสอบสถานะ container ที่ชนชื่อ:
+
+```bash
+docker ps -a --filter "name=binance-bot"
+```
+
+> **Tip:** แนะนำให้ตั้งชื่อ container ให้สอดคล้องกับหน้าที่ เช่น `binance-live-dcr-zec`, `binance-dashboard`, `binance-paper` เพื่อป้องกันชื่อซ้ำ.
+
 ### Start/Stop Specific Trading Pair
 
 หยุด Bot เฉพาะคู่เหรียญ:
