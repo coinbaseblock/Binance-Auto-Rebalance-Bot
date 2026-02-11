@@ -146,157 +146,110 @@ docker compose up -d dashboard
 | `paper` | Paper trading (testnet) | - | `docker compose --profile paper up paper` |
 | `live` | Live trading (real money) | - | `docker compose --profile live up live` |
 
-### Docker Commands
+### Docker Build
 
 ```bash
-# 1. Build (Windows - use build-docker.bat or disable BuildKit)
+# Option 1: Use the build script (Windows)
 build-docker.bat
-# OR
+
+# Option 2: Disable BuildKit for Windows compatibility
 set DOCKER_BUILDKIT=0
 docker build -t binance-dcr-bot .
 
-# 2. Run DCR Live
-docker-compose up dcr-live
-
-# หรือรันแบบ background
-docker-compose up -d dcr-live
-
-# 3. View logs
-docker logs -f binance-dcr-live
+# Option 3: Standard build (Linux/macOS)
+docker build -t binance-dcr-bot .
 ```
 
-### Docker Operations Reference
+### Docker Commands Reference
 
-| Operation | Command |
-|-----------|---------|
-| Run DCR Live | `docker-compose up dcr-live` |
-| Run DCR Live (background) | `docker-compose up -d dcr-live` |
-| Run Simulation | `docker-compose --profile simulation up dcr-simulation` |
-| Run Dashboard | `docker-compose --profile dashboard up dashboard` |
-| Stop Bot | `docker-compose down` |
-| View Status | `docker ps` |
-| Restart Bot | `docker restart binance-dcr-live` |
-| View Logs | `docker logs -f binance-dcr-live` |
+| Action | Command |
+|--------|---------|
+| Start with Docker Compose | `docker compose up -d` |
+| Stop all services | `docker compose down` |
+| View logs | `docker logs -f <container-name>` |
+| Check running containers | `docker ps --filter "name=binance-"` |
+| Check all containers (including stopped) | `docker ps -a --filter "name=binance-"` |
 
-### Docker: Fix `container name is already in use`
+### Troubleshooting: Container Name Already in Use
 
-หากเจอ error นี้:
+If you get this error:
 
 ```text
-docker: Error response from daemon: Conflict. The container name "/binance-bot" is already in use...
+docker: Error response from daemon: Conflict. The container name "/binance-bot" is already in use by container "8f3e5a509a5e0b2ed25e77909fd890828fef1879c3d7150fd2ac6810dc4433c3". You have to remove (or rename) that container to be able to reuse that name.
 ```
 
-หมายความว่าเคยมี container ชื่อนี้อยู่แล้ว (แม้จะ `Exited` ไปแล้วก็ตาม) ให้เลือกวิธีใดวิธีหนึ่ง:
+This means a container with that name already exists (even if it's stopped). Choose one of these solutions:
 
+**Solution 1: Reuse the stopped container**
 ```bash
-# 1) Start container เดิมที่มีอยู่แล้ว
 docker start binance-bot
-
-# 2) ลบ container เดิม แล้ว run ใหม่ด้วยชื่อเดิม
-docker rm binance-bot
-docker run --name binance-bot -p 5000:5000 --env-file .env binance-dcr-bot python main.py --mode live --port 5000 --strategies dcr_balanced zec_balanced
-
-# 3) ใช้ชื่อใหม่ไปเลย (ถ้าต้องการรันคนละ instance)
-docker run --name binance-bot-2 -p 5000:5000 --env-file .env binance-dcr-bot python main.py --mode live --port 5000 --strategies dcr_balanced zec_balanced
 ```
 
-ตรวจสอบสถานะ container ที่ชนชื่อ:
+**Solution 2: Remove the old container and create a new one**
+```bash
+docker stop binance-bot
+docker rm binance-bot
+docker run -d --name binance-bot \
+  -p 5000:5000 \
+  --env-file .env \
+  binance-dcr-bot \
+  python main.py --mode live --port 5000 --strategies dcr_balanced zec_balanced
+```
 
+**Solution 3: Use a different container name**
+```bash
+docker run -d --name binance-bot-live \
+  -p 5000:5000 \
+  --env-file .env \
+  binance-dcr-bot \
+  python main.py --mode live --port 5000 --strategies dcr_balanced zec_balanced
+```
+
+**Check container status:**
 ```bash
 docker ps -a --filter "name=binance-bot"
 ```
 
-> **Tip:** แนะนำให้ตั้งชื่อ container ให้สอดคล้องกับหน้าที่ เช่น `binance-live-dcr-zec`, `binance-dashboard`, `binance-paper` เพื่อป้องกันชื่อซ้ำ.
+> **Tip:** Use descriptive container names for different purposes, e.g., `binance-live-dcr-zec`, `binance-dashboard`, `binance-paper` to avoid name conflicts.
 
-### Start/Stop Specific Trading Pair
+### Running Multiple Trading Instances
 
-หยุด Bot เฉพาะคู่เหรียญ:
+To run the bot with different trading pairs simultaneously:
 
+**Example: Run DCR and ZEC strategies**
 ```bash
-# Stop และ Remove container เฉพาะคู่ DCR/USDT
-docker stop binance-dcr-live && docker rm binance-dcr-live
-
-# Start ใหม่ด้วย docker run
 docker run -d --name binance-dcr-live \
   --env-file .env \
   -v $(pwd)/logs:/app/logs \
   -v $(pwd)/data:/app/data \
   binance-dcr-bot \
-  python main.py --mode live --symbol DCR/USDT
+  python main.py --mode live --strategies dcr_balanced
 
-# หรือใช้ docker-compose (แนะนำ)
-docker-compose --profile dcr up -d dcr-live
-```
-
-รันคู่เหรียญอื่น (ตัวอย่าง BTC/USDT):
-
-```bash
-# รัน BTC/USDT
-docker run -d --name binance-btc-live \
+docker run -d --name binance-zec-live \
   --env-file .env \
   -v $(pwd)/logs:/app/logs \
   -v $(pwd)/data:/app/data \
   binance-dcr-bot \
-  python main.py --mode live --symbol BTC/USDT
-
-# รัน ETH/USDT
-docker run -d --name binance-eth-live \
-  --env-file .env \
-  -v $(pwd)/logs:/app/logs \
-  -v $(pwd)/data:/app/data \
-  binance-dcr-bot \
-  python main.py --mode live --symbol ETH/USDT
-
-# Stop เฉพาะ BTC
-docker stop binance-btc-live && docker rm binance-btc-live
-
-# Stop เฉพาะ ETH
-docker stop binance-eth-live && docker rm binance-eth-live
+  python main.py --mode live --strategies zec_balanced
 ```
 
-### Start/Stop All Bots
-
-หยุด Bot ทั้งหมด:
-
+**Stop specific instances:**
 ```bash
-# Stop ทุก container ที่เกี่ยวกับ binance-bot
+# Stop DCR instance
+docker stop binance-dcr-live && docker rm binance-dcr-live
+
+# Stop ZEC instance
+docker stop binance-zec-live && docker rm binance-zec-live
+```
+
+**Stop all Binance bot containers:**
+```bash
 docker stop $(docker ps -q --filter "name=binance-")
 docker rm $(docker ps -aq --filter "name=binance-")
 
-# หรือใช้ docker-compose (แนะนำ)
-docker-compose down
+# Or use Docker Compose
+docker compose down
 ```
-
-Start Bot ทั้งหมด:
-
-```bash
-# Start ทุก service ด้วย docker-compose
-docker-compose up -d
-
-# Start พร้อม DCR Live
-docker-compose --profile dcr up -d
-
-# Start หลายคู่พร้อมกัน (ใช้ docker run)
-docker run -d --name binance-btc-live --env-file .env -v $(pwd)/logs:/app/logs -v $(pwd)/data:/app/data binance-dcr-bot python main.py --mode live --symbol BTC/USDT
-docker run -d --name binance-eth-live --env-file .env -v $(pwd)/logs:/app/logs -v $(pwd)/data:/app/data binance-dcr-bot python main.py --mode live --symbol ETH/USDT
-docker run -d --name binance-dcr-live --env-file .env -v $(pwd)/logs:/app/logs -v $(pwd)/data:/app/data binance-dcr-bot python main.py --mode live --symbol DCR/USDT
-
-docker run --name binance-bot -p 5000:5000 --env-file .env binance-dcr-bot python main.py --mode dashboard --port 5000 --strategies dcr_balanced
-
-```
-
-### Quick Reference Table
-
-| Action | Command |
-|--------|---------|
-| Stop เฉพาะ DCR | `docker stop binance-dcr-live && docker rm binance-dcr-live` |
-| Stop เฉพาะ BTC | `docker stop binance-btc-live && docker rm binance-btc-live` |
-| Stop ทั้งหมด | `docker stop $(docker ps -q --filter "name=binance-")` |
-| Remove ทั้งหมด | `docker rm $(docker ps -aq --filter "name=binance-")` |
-| Start DCR | `docker-compose --profile dcr up -d dcr-live` |
-| Start All | `docker-compose up -d` |
-| View All Bots | `docker ps --filter "name=binance-"` |
-| View Logs | `docker logs -f binance-dcr-live` |
 
 ### Troubleshooting Docker on Windows
 
@@ -328,7 +281,7 @@ To clean up Docker resources related to this project:
 
 ```bash
 # 1. Stop and remove containers/volumes/networks for this project
-docker-compose down --volumes --remove-orphans
+docker compose down --volumes --remove-orphans
 
 # 2. Remove the built image
 docker image rm binance-dcr-bot
@@ -338,30 +291,26 @@ docker image rm binance-dcr-bot
 docker system prune -a --volumes
 ```
 
-### Legacy Docker Commands
+### Docker Compose Services
 
 ```bash
-# Start dashboard (default service)
-docker compose up -d dashboard
+# View available services
+docker compose config --services
 
-# Start demo dashboard
-docker compose --profile demo up -d dashboard-demo
+# Start specific service
+docker compose up -d <service-name>
 
-# Start paper trading bot
-docker compose --profile paper up -d paper
+# View logs for a service
+docker compose logs -f <service-name>
 
-# Start live trading bot (USE WITH CAUTION!)
-docker compose --profile live up -d live
-
-# View logs
-docker compose logs -f dashboard
+# Rebuild after code changes
+docker compose build --no-cache
 
 # Stop all services
 docker compose down
 
-# Rebuild after code changes
-docker compose build --no-cache
-docker compose up -d dashboard
+# Stop and remove volumes
+docker compose down --volumes
 ```
 
 ### Volume Mounts
