@@ -7,7 +7,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import requests.exceptions
 
@@ -65,6 +65,19 @@ def run_backtest(args):
     client = BinanceClient(testnet=True)
     data_loader = DataLoader(client)
 
+    # Resolve the date range: --days N takes precedence and runs N days back
+    # from today; otherwise fall back to --start / --end.
+    if args.days is not None:
+        end_dt = datetime.utcnow()
+        start_dt = end_dt - timedelta(days=int(args.days))
+        start_date = start_dt.strftime('%Y-%m-%d')
+        end_date = end_dt.strftime('%Y-%m-%d')
+        logger.info(f"Backtest window: last {args.days} days ({start_date} → {end_date})")
+    else:
+        start_date = args.start
+        end_date = args.end
+        logger.info(f"Backtest window: {start_date} → {end_date}")
+
     # Load strategies
     strategies = load_strategies(args.strategies)
 
@@ -73,13 +86,17 @@ def run_backtest(args):
         logger.info(f"Backtesting: {strategy.config['name']}")
         logger.info(f"{'='*60}")
 
+        # Distribution mode needs finer granularity so each child's narrow
+        # price band can actually be resolved inside the candle.
+        interval = args.interval or ('5m' if strategy.is_distribution_mode() else '1h')
+
         # Load historical data
         symbol = strategy.config['pair']
         data = data_loader.load_historical_data(
             symbol=symbol,
-            interval='1h',
-            start_date=args.start,
-            end_date=args.end
+            interval=interval,
+            start_date=start_date,
+            end_date=end_date
         )
 
         # Run backtest
@@ -87,7 +104,7 @@ def run_backtest(args):
         report = backtester.run()
 
         # Print report
-        print(json.dumps(report, indent=2))
+        print(json.dumps(report, indent=2, default=str))
 
         # Save report
         report_file = f"logs/backtest_{strategy.config['name'].replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
@@ -122,8 +139,13 @@ def run_live_trading(args):
         # Log all planned ladder levels so user can see the plan
         order_manager.log_planned_ladders(strategy)
 
-        # Place initial order (sequential: only first order, normal: all at once)
-        if order_manager.is_sequential_mode(strategy):
+        # Place initial order(s) based on order_placement.mode
+        if order_manager.is_distribution_mode(strategy):
+            order_manager.log_planned_distribution(strategy)
+            logger.info(f"{strategy.config['name']}: Distribution mode - children will be "
+                       f"placed as price approaches each child price (respecting open-order cap)")
+            order_manager.place_distribution_orders(strategy, current_price)
+        elif order_manager.is_sequential_mode(strategy):
             logger.info(f"{strategy.config['name']}: Sequential mode - placing first order only, "
                        f"next orders will be placed as price approaches each level")
             order_manager.place_next_sequential_order(strategy, current_price)
@@ -150,7 +172,14 @@ def run_live_trading(args):
                             # Find the strategy
                             for strategy in strategies:
                                 if strategy.config['name'] == order_data['strategy']:
-                                    order_manager.place_sell_order(strategy, order_data['ladder'])
+                                    child = order_data.get('child')
+                                    if child is not None:
+                                        order_manager._place_child_sell(
+                                            strategy, child, order_data['ladder'],
+                                            order_data.get('filled_qty', child['qty'])
+                                        )
+                                    else:
+                                        order_manager.place_sell_order(strategy, order_data['ladder'])
 
                 # Update portfolio statistics
                 current_prices = {}
@@ -168,8 +197,10 @@ def run_live_trading(args):
 
                 # Sequential mode: check if price is approaching next levels
                 for strategy in strategies:
-                    if order_manager.is_sequential_mode(strategy):
-                        cp = current_prices[strategy.config['pair']]
+                    cp = current_prices[strategy.config['pair']]
+                    if order_manager.is_distribution_mode(strategy):
+                        order_manager.place_distribution_orders(strategy, cp)
+                    elif order_manager.is_sequential_mode(strategy):
                         order_manager.place_next_sequential_order(strategy, cp)
 
                 # Auto-restart: when all positions are closed and no active orders for a strategy
@@ -185,7 +216,11 @@ def run_live_trading(args):
                         strategy.reset_ladders()
                         strategy.update_prices(current_price)
                         order_manager.log_planned_ladders(strategy)
-                        if order_manager.is_sequential_mode(strategy):
+                        if order_manager.is_distribution_mode(strategy):
+                            order_manager.reset_distribution_state(strategy.config['name'])
+                            order_manager.log_planned_distribution(strategy)
+                            order_manager.place_distribution_orders(strategy, current_price)
+                        elif order_manager.is_sequential_mode(strategy):
                             order_manager.reset_sequential_state(strategy.config['name'])
                             order_manager.place_next_sequential_order(strategy, current_price)
                         else:
@@ -355,6 +390,11 @@ def main():
                        help='Strategy names or "all"')
     parser.add_argument('--start', help='Backtest start date (YYYY-MM-DD)')
     parser.add_argument('--end', help='Backtest end date (YYYY-MM-DD)')
+    parser.add_argument('--days', type=int,
+                       help='Backtest: run the last N days (overrides --start/--end)')
+    parser.add_argument('--interval',
+                       help='Backtest candle interval (e.g. 1m, 5m, 15m, 1h, 4h, 1d). '
+                            'Default: 1h for normal/sequential, 5m for distribution.')
     parser.add_argument('--port', type=int, default=5000,
                        help='Dashboard web server port (default: 5000)')
     parser.add_argument('--demo', action='store_true',
@@ -368,8 +408,8 @@ def main():
 
     # Run appropriate mode
     if args.mode == 'backtest':
-        if not args.start or not args.end:
-            parser.error("Backtest mode requires --start and --end dates")
+        if args.days is None and (not args.start or not args.end):
+            parser.error("Backtest mode requires either --days N or both --start and --end")
         run_backtest(args)
     elif args.mode == 'live':
         run_live_trading(args)

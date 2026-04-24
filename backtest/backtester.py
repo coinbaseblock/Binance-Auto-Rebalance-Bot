@@ -28,6 +28,9 @@ class Backtester:
         starting_price = self.data['close'].iloc[0]
         self.strategy.update_prices(starting_price)
 
+        if self.strategy.is_distribution_mode():
+            return self._run_distribution()
+
         # Track which ladders are active
         active_ladders = []
 
@@ -101,6 +104,129 @@ class Backtester:
                 'total_value': total_value
             })
 
+        return self.generate_report()
+
+    def _run_distribution(self):
+        """Backtest variant for distribution mode: each ladder is split into
+        Fibonacci-weighted children (see Strategy.calculate_child_orders). Each
+        child goes through pending → placed (buy) → active → closed (sell),
+        mirroring the live OrderManager. Children are promoted only when the
+        market price is within proximity, and only when the simulated open-order
+        count is below the configured cap — so the simulation matches the
+        exchange's real limitations.
+        """
+        dist_cfg = self.strategy.get_distribution_config()
+        proximity = dist_cfg['proximity_percent']
+        cap = dist_cfg['max_open_orders_cap']
+
+        # Build pending children for every ladder
+        all_children = self.strategy.calculate_all_child_orders()
+        pending = []  # queue of children waiting to be placed (sorted top-first)
+        for ladder in self.strategy.ladders:
+            children = all_children.get(ladder['level'], [])
+            ladder['children_total'] = len(children)
+            ladder['children_closed'] = 0
+            for c in children:
+                c['parent_ladder'] = ladder
+                c['_buy_time'] = None
+                c['_buy_cost'] = None
+            pending.extend(children)
+        pending.sort(key=lambda c: c['buy_price'], reverse=True)
+
+        # Simulated books
+        active_buys = []   # children with open BUY order
+        active_sells = []  # children with open SELL order
+
+        total_children = len(pending)
+        logger.info(f"Distribution backtest: {total_children} children across "
+                    f"{len(self.strategy.ladders)} ladders, cap={cap}, "
+                    f"proximity={proximity:.1%}")
+
+        for timestamp, row in self.data.iterrows():
+            open_price = row['open']
+            close_price = row['close']
+            low_price = row['low']
+            high_price = row['high']
+
+            # 1. Promote pending children that are in proximity and fit the cap
+            def open_count():
+                return len(active_buys) + len(active_sells)
+
+            for child in list(pending):
+                if open_count() >= cap:
+                    break
+                if open_price <= child['buy_price']:
+                    should_promote = True
+                else:
+                    distance = (open_price - child['buy_price']) / open_price
+                    should_promote = distance <= proximity
+                if not should_promote:
+                    break  # sorted top-first; rest are farther away
+                pending.remove(child)
+                active_buys.append(child)
+                child['status'] = 'placed'
+
+            # 2. Check child BUY fills (limit buy fills when candle low crosses)
+            for child in list(active_buys):
+                if low_price <= child['buy_price']:
+                    cost = child['qty'] * child['buy_price']
+                    fee = cost * 0.001
+                    total_cost = cost + fee
+                    if self.capital < total_cost:
+                        continue  # insufficient capital — skip this candle
+                    self.capital -= total_cost
+                    child['_buy_time'] = timestamp
+                    child['_buy_cost'] = total_cost
+                    child['status'] = 'active'
+                    active_buys.remove(child)
+                    active_sells.append(child)
+                    child['parent_ladder']['status'] = 'active'
+
+            # 3. Check child SELL fills (limit sell fills when candle high crosses)
+            for child in list(active_sells):
+                sell_price = child['parent_ladder']['sell_price']
+                if high_price >= sell_price:
+                    revenue = child['qty'] * sell_price
+                    fee = revenue * 0.001
+                    net_revenue = revenue - fee
+                    profit = net_revenue - child['_buy_cost']
+                    self.capital += net_revenue
+
+                    self.trades.append({
+                        'buy_time': child['_buy_time'],
+                        'sell_time': timestamp,
+                        'level': child['parent_level'],
+                        'child_idx': child['idx'],
+                        'buy_price': child['buy_price'],
+                        'sell_price': sell_price,
+                        'quantity': child['qty'],
+                        'cost': child['_buy_cost'],
+                        'revenue': net_revenue,
+                        'profit': profit,
+                        'roi': (profit / child['_buy_cost']) * 100 if child['_buy_cost'] else 0,
+                    })
+                    active_sells.remove(child)
+                    child['status'] = 'closed'
+                    parent = child['parent_ladder']
+                    parent['children_closed'] = parent.get('children_closed', 0) + 1
+                    if parent['children_closed'] >= parent['children_total']:
+                        parent['status'] = 'closed'
+
+            # 4. Mark-to-market portfolio value
+            positions_value = sum(c['qty'] * close_price for c in active_sells)
+            # active_buys have not filled yet — their USDT still counts as cash
+            self.portfolio_value.append({
+                'timestamp': timestamp,
+                'cash': self.capital,
+                'positions_value': positions_value,
+                'total_value': self.capital + positions_value,
+                'pending_children': len(pending),
+                'placed_children': len(active_buys) + len(active_sells),
+            })
+
+        logger.info(f"Distribution backtest complete: {len(self.trades)}/{total_children} children closed, "
+                    f"{len(pending)} never promoted, {len(active_buys)} never filled, "
+                    f"{len(active_sells)} never sold")
         return self.generate_report()
 
     def generate_report(self):
