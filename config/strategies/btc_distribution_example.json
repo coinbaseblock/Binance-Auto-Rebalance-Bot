@@ -1,0 +1,40 @@
+{
+  "enabled": true,
+  "name": "BTC Distribution Example",
+  "pair": "BTCUSDT",
+  "description": "Distribution mode: spreads each ladder into child orders for smoother fills",
+
+  "ladder_config": {
+    "base_gap": 0.01,
+    "ladders": 6,
+    "fibonacci": [1, 1, 2, 3, 5, 8],
+    "unit_size_btc": 0.01,
+    "gap_max": 0.95
+  },
+
+  "capital_allocation": {
+    "max_allocation_percent": 0.25,
+    "reserve_percent": 0.10
+  },
+
+  "risk_management": {
+    "safety_multiplier": 1.5,
+    "stop_loss_percent": -0.25,
+    "take_profit_percent": 0.20
+  },
+
+  "execution": {
+    "auto_rebalance": true,
+    "rebalance_interval_hours": 24,
+    "min_profit_to_close": 0.005
+  },
+
+  "order_placement": {
+    "mode": "distribution",
+    "child_order_usdt": 20.0,
+    "proximity_percent": 0.02,
+    "max_open_orders_cap": 180,
+    "min_children_per_ladder": 2,
+    "max_children_per_ladder": 15
+  }
+}
