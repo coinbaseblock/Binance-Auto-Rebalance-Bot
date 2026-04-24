@@ -361,6 +361,179 @@ python main.py --mode backtest --strategies btc_conservative --start 2024-01-01 
 python main.py --mode paper --strategies all
 ```
 
+### Backtest with `--days` shortcut
+
+```bash
+# Last N days (auto end = today)
+python main.py --mode backtest --strategies btc_conservative --days 30
+
+# Explicit range (takes precedence of --days)
+python main.py --mode backtest --strategies all --start 2024-01-01 --end 2024-03-01
+
+# Force a specific candle interval
+python main.py --mode backtest --strategies btc_conservative --days 7 --interval 1h
+```
+
+Distribution-mode strategies auto-select `5m` candles so narrow child price
+bands resolve cleanly; pass `--interval 1h` to override.
+
+## Distribution Order Mode
+
+`order_placement.mode = "distribution"` splits each ladder into several
+Fibonacci-weighted **child orders** that mirror the main ladder's shape
+(compound price spacing + size growing toward the bottom). Children stay in
+an in-memory pending queue and are promoted to Binance only when price is
+near them — so the bot stays within the exchange's hard limits on open-order
+count and price distance (`PERCENT_PRICE_BY_SIDE`).
+
+### How it works (one ladder at a time)
+
+1. **Split** — `calculate_child_orders()` turns a ladder into N children
+   (N scaled by `child_order_usdt`, clamped to
+   `[min_children_per_ladder, max_children_per_ladder]`). Prices use
+   compound multiplicative gaps weighted by Fibonacci, so top children sit
+   dense near the ladder's buy price and deeper ones spread toward the next
+   ladder's buy price. Sizes are Fibonacci-weighted too (deeper = bigger)
+   and sum exactly to the parent's USDT.
+2. **Queue** — All children across all ladders land in a single in-memory
+   pending queue, sorted top-price-first.
+3. **Promote** — On every price tick, `_promote_pending_children()` sends a
+   child to Binance only when **both** hold:
+   - `current_price` is within `proximity_percent` of the child's buy price
+     (or already at/below it), **and**
+   - the symbol's open-order count is below `max_open_orders_cap`.
+4. **Hybrid SELL on fill** — When a child BUY fills, the bot immediately
+   places a SELL at the parent ladder's `sell_price`. Profit stays exactly
+   as planned; deeper children that buy cheaper just earn extra.
+
+### Configuration
+
+Add an `order_placement` block to your strategy JSON:
+
+```json
+{
+  "name": "BTC Distribution Example",
+  "pair": "BTCUSDT",
+  "ladder_config": { "base_gap": 0.01, "ladders": 6, "fibonacci": [1, 1, 2, 3, 5, 8], "unit_size_btc": 0.01 },
+  "order_placement": {
+    "mode": "distribution",
+    "child_order_usdt": 20.0,
+    "proximity_percent": 0.02,
+    "max_open_orders_cap": 180,
+    "min_children_per_ladder": 2,
+    "max_children_per_ladder": 15
+  }
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `mode` | `"normal"` | Set to `"distribution"` to enable. |
+| `child_order_usdt` | 20.0 | Target USDT per child; actual count scales to fit the parent. |
+| `proximity_percent` | 0.02 | Max distance (fraction) from market before a child is promoted. |
+| `max_open_orders_cap` | 180 | Hard ceiling on promoted orders per symbol (Binance limit ≈ 200). |
+| `min_children_per_ladder` | 2 | Floor on splits per ladder. |
+| `max_children_per_ladder` | 15 | Ceiling on splits per ladder. |
+
+A ready-to-run example lives at
+`config/strategies/btc_distribution_example.json`.
+
+### Usage
+
+```bash
+# Live / paper (testnet) — loop auto-routes to distribution when config enables it
+python main.py --mode live  --strategies btc_distribution_example
+python main.py --mode paper --strategies all
+
+# Backtest (auto-picks 5m interval for distribution strategies)
+python main.py --mode backtest --strategies btc_distribution_example --days 30
+```
+
+### Testing recommendations
+
+Before enabling on a funded account, we recommend the following order:
+
+**1. Unit / math invariants** (already covered by `tests/test_distribution.py`):
+
+```bash
+python -m pytest tests/ -v                      # all 33 tests
+python -m pytest tests/test_distribution.py -v  # 12 distribution tests
+```
+
+The existing suite asserts: child USDT sums to parent, prices are sorted
+descending and bounded by the next ladder, sell price is hybrid-paired,
+sizing is Fibonacci-weighted, and caps clamp correctly.
+
+**2. Gaps the suite does not yet cover** — worth adding before production:
+
+- **Proximity boundary** — promote at `buy × (1 + proximity)` exactly, skip
+  one tick above.
+- **Cap exhaustion + recovery** — set `max_open_orders_cap` low (e.g. 3),
+  run an oscillating price series, verify pending queue holds and resumes
+  after SELL fills free slots.
+- **Multi-symbol cap accounting** — if you run two strategies on the same
+  pair, confirm cap is counted per-symbol, not per-strategy.
+- **Partial BUY fills** — Binance may fill only part of a child; check that
+  the hybrid SELL qty matches `filled_qty`, and that any remainder is not
+  silently lost.
+- **Restart mid-cycle** — the pending queue lives in memory. Kill the bot,
+  restart, and verify it neither duplicates orders already on Binance nor
+  drops queued children.
+
+**3. Behavioural / integration**:
+
+- Run **paper trading for at least a week** with the same strategy in
+  `normal` and `distribution` mode and compare fill count, avg slippage,
+  drawdown, and orders-on-exchange.
+- Backtest 30–90 days across a volatile and a ranging window; inspect
+  `portfolio_value[i]['pending_children']` — how often did the cap pin the
+  queue? If it's pinned most of the time, lower `child_order_usdt` or raise
+  the cap.
+- Dry-run one cycle on live with **tiny capital** (e.g. 50 USDT) before
+  scaling up.
+
+### Extending the feature
+
+If you want to build on top of distribution mode, the highest-leverage
+changes are, in order:
+
+1. **Persist the pending queue** *(high urgency).* Today
+   `_pending_children` lives only in memory. A bot restart loses the queue
+   and can duplicate orders already on Binance. Start at
+   `src/order_manager.py:21` — add JSON/SQLite serialise/deserialise around
+   `place_distribution_orders()` and the constructor.
+2. **Per-symbol cap accounting** *(high urgency if you run multiple
+   strategies on one pair).* Review the open-order count inside
+   `_promote_pending_children()` (`src/order_manager.py:336`) to make sure
+   it counts every order on the symbol, not only those owned by the current
+   strategy.
+3. **Stop-loss / cycle-close semantics for children** *(medium-high).* When
+   a stop-loss triggers, decide what happens to promoted BUYs awaiting
+   SELL, to promoted SELLs, and to the pending queue. Today the flow is
+   implicit — make it explicit and tested.
+4. **Child-level analytics** *(medium).* The backtester already records
+   `child_idx`, `buy_price`, per-child profit/ROI. Mirror that in live:
+   log each SELL fill with `{parent_level, child_idx, actual_buy,
+   planned_sell, actual_profit}` from `_place_child_sell()`.
+5. **Dynamic child sizing** *(medium).* `child_order_usdt` is static. Scale
+   it from ATR or remaining balance — entry point is the child-count math
+   at `src/strategy.py:172-207`.
+6. **Partial-fill handling** *(medium).* Track remainder on the child,
+   re-promote only the unfilled portion, and size the hybrid SELL off
+   `filled_qty` rather than `child.qty`.
+7. **Sequential + distribution combo** *(exploratory).* Verify whether the
+   current queue ordering matches the intent of the "Sequential" mode —
+   global top-price-first vs. strictly per-ladder ordering.
+
+Key code anchors when you dig in:
+
+- `src/strategy.py:147, 232, 234, 248` — child price/size math.
+- `src/order_manager.py:21, 290, 321, 336, 352, 427` — pending queue,
+  proximity/cap gating, hybrid SELL pairing.
+- `backtest/backtester.py:109` — distribution simulation branch.
+- `main.py:68-91, 143-147, 201-222` — CLI flags and live loop routing.
+- `tests/test_distribution.py` — 12 tests (10 strategy math, 2 backtest).
+
 ## Strategy Examples
 
 ### Conservative (Low Risk)
