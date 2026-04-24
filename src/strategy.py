@@ -3,9 +3,22 @@ Strategy Configuration and Ladder Calculation
 """
 import json
 import logging
+import math
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _generate_fibonacci(n):
+    """Return the first n Fibonacci numbers starting [1, 1, 2, 3, 5, ...]."""
+    if n <= 0:
+        return []
+    if n == 1:
+        return [1]
+    fib = [1, 1]
+    while len(fib) < n:
+        fib.append(fib[-1] + fib[-2])
+    return fib[:n]
 
 
 class Strategy:
@@ -115,6 +128,130 @@ class Strategy:
     def calculate_required_capital(self):
         """Calculate total capital required if all ladders are triggered"""
         return sum(ladder['usdt_cost'] for ladder in self.ladders)
+
+    def get_distribution_config(self):
+        """Return distribution-mode config with defaults applied."""
+        placement = self.config.get('order_placement', {})
+        return {
+            'child_order_usdt': placement.get('child_order_usdt', 20.0),
+            'proximity_percent': placement.get('proximity_percent', 0.02),
+            'max_open_orders_cap': placement.get('max_open_orders_cap', 180),
+            'min_children_per_ladder': placement.get('min_children_per_ladder', 2),
+            'max_children_per_ladder': placement.get('max_children_per_ladder', 15),
+        }
+
+    def is_distribution_mode(self):
+        """Check whether this strategy uses distribution order placement."""
+        return self.config.get('order_placement', {}).get('mode') == 'distribution'
+
+    def calculate_child_orders(self, ladder, next_ladder_buy_price=None):
+        """Split a ladder into N child orders mimicking the main ladder's shape.
+
+        Design (matches the main ladder's Fibonacci + compound-gap pattern):
+          - Price spacing: compound multiplicative gaps, Fibonacci-weighted,
+            so children sit denser near the top and spread out toward the bottom.
+          - Sizing: Fibonacci-weighted USDT per child (deeper children carry more),
+            summing exactly to the parent ladder's usdt_cost.
+          - Sell price: all children share ladder['sell_price'] (hybrid pairing),
+            preserving the planned profit: deeper children also earn extra.
+
+        The child price range is [next_ladder_buy_price, ladder['buy_price']].
+        For the deepest ladder (no next), we extrapolate using the ladder's own
+        gap_percent so the span matches the existing cadence.
+
+        Args:
+            ladder: dict with buy_price, sell_price, usdt_cost, level, gap_percent
+            next_ladder_buy_price: buy_price of the ladder one level deeper, or
+                None if this is the deepest ladder.
+
+        Returns:
+            list of child dicts: {idx, parent_level, buy_price, sell_price,
+                usdt_cost, qty, status}
+        """
+        cfg = self.get_distribution_config()
+        target_size = cfg['child_order_usdt']
+        min_n = max(1, int(cfg['min_children_per_ladder']))
+        max_n = max(min_n, int(cfg['max_children_per_ladder']))
+
+        top_price = ladder['buy_price']
+        total_usdt = ladder['usdt_cost']
+
+        if top_price <= 0 or total_usdt <= 0:
+            return []
+
+        # Lower bound of the child range
+        if next_ladder_buy_price is not None and next_ladder_buy_price > 0:
+            bottom_price = next_ladder_buy_price
+        else:
+            # Deepest ladder: extrapolate using its own gap_percent
+            gap = ladder.get('gap_percent', 0.02)
+            bottom_price = top_price * (1 - max(gap, 0.005))
+
+        if bottom_price >= top_price:
+            # Degenerate range — place a single child at top_price
+            return [{
+                'idx': 0,
+                'parent_level': ladder['level'],
+                'buy_price': top_price,
+                'sell_price': ladder['sell_price'],
+                'usdt_cost': total_usdt,
+                'qty': total_usdt / top_price,
+                'status': 'pending',
+            }]
+
+        # Choose child count based on target size, clamped to [min_n, max_n]
+        raw_n = round(total_usdt / max(target_size, 1e-9))
+        n = max(min_n, min(max_n, raw_n))
+        # Need at least 2 to actually spread; fall back to 1 for tiny ladders
+        if total_usdt < target_size * 1.5:
+            n = 1
+
+        if n == 1:
+            return [{
+                'idx': 0,
+                'parent_level': ladder['level'],
+                'buy_price': top_price,
+                'sell_price': ladder['sell_price'],
+                'usdt_cost': total_usdt,
+                'qty': total_usdt / top_price,
+                'status': 'pending',
+            }]
+
+        fib = _generate_fibonacci(n)
+        fib_total = float(sum(fib))
+
+        # Distribute the total drop log-linearly using Fibonacci weights so
+        # the cumulative product of (1 - gap_i) exactly hits bottom/top.
+        full_drop_ratio = 1.0 - (bottom_price / top_price)
+        target_log = -math.log(1.0 - full_drop_ratio)
+        log_gaps = [target_log * (w / fib_total) for w in fib]
+
+        children = []
+        cumulative_mult = 1.0
+        for i in range(n):
+            cumulative_mult *= math.exp(-log_gaps[i])
+            child_price = top_price * cumulative_mult
+            child_usdt = total_usdt * (fib[i] / fib_total)
+            child_qty = child_usdt / child_price if child_price > 0 else 0
+            children.append({
+                'idx': i,
+                'parent_level': ladder['level'],
+                'buy_price': child_price,
+                'sell_price': ladder['sell_price'],
+                'usdt_cost': child_usdt,
+                'qty': child_qty,
+                'status': 'pending',
+            })
+
+        return children
+
+    def calculate_all_child_orders(self):
+        """Return {ladder_level: [children]} for every ladder (distribution mode)."""
+        result = {}
+        for i, ladder in enumerate(self.ladders):
+            next_buy = self.ladders[i + 1]['buy_price'] if i + 1 < len(self.ladders) else None
+            result[ladder['level']] = self.calculate_child_orders(ladder, next_buy)
+        return result
 
     def to_dict(self):
         """Export strategy as dictionary"""
