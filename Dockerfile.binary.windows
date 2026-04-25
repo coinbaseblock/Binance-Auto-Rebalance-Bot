@@ -10,11 +10,12 @@
 #
 # Output: /binance-bot.exe
 # ----------------------------------------------------------------------------
-# Pinned to the Python 3.12 variant so prebuilt cp312 wheels exist for
-# pandas==2.1.4 / numpy==1.26.2. The :latest tag ships Python 3.13, which has
-# no cp313 wheels for those pins and forces a source build that needs MSVC
-# (unavailable under Wine).
-FROM batonogov/pyinstaller-windows:python-3.12 AS builder
+# Pinned to a specific Python 3.12 patch tag so prebuilt cp312 wheels exist
+# for pandas==2.1.4 / numpy==1.26.2. The :latest tag ships Python 3.13, which
+# has no cp313 wheels for those pins and forces a source build that needs
+# MSVC (unavailable under Wine). The bare `python-3.12` rolling tag does
+# not exist on Docker Hub — only patch-level tags (python-3.12.0/.1/.2) do.
+FROM batonogov/pyinstaller-windows:python-3.12.2 AS builder
 
 WORKDIR /src
 
