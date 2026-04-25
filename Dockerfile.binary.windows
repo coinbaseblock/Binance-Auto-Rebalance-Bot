@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1
+# ----------------------------------------------------------------------------
+# Dockerfile.binary.windows — produce a Windows .exe via PyInstaller running
+# under Wine inside Linux. Built on the maintained `batonogov/pyinstaller-
+# windows` image so we don't have to install Wine + Python ourselves.
+#
+# Used by scripts/build-binaries.sh:
+#   docker buildx build --platform linux/amd64 -f Dockerfile.binary.windows \
+#       -o type=local,dest=dist/windows-amd64 .
+#
+# Output: /binance-bot.exe
+# ----------------------------------------------------------------------------
+FROM batonogov/pyinstaller-windows:latest AS builder
+
+WORKDIR /src
+
+COPY requirements.txt ./
+COPY . ./
+
+# The base image's `pyinstaller` shim runs PyInstaller via Wine. Note the
+# Windows path separator (`;`) in --add-data.
+RUN /bin/bash -lc "\
+    pip install --no-cache-dir -r requirements.txt && \
+    pyinstaller --clean --noconfirm \
+        --onefile \
+        --name binance-bot \
+        --add-data 'src/templates;src/templates' \
+        --hidden-import=engineio.async_drivers.eventlet \
+        --hidden-import=eventlet.hubs.epolls \
+        --hidden-import=eventlet.hubs.selects \
+        --hidden-import=dns \
+        --hidden-import=dns.dnssec \
+        --hidden-import=dns.e164 \
+        --hidden-import=dns.namedict \
+        --hidden-import=dns.tsigkeyring \
+        --hidden-import=dns.update \
+        --hidden-import=dns.versioned \
+        --collect-submodules=engineio \
+        --collect-submodules=socketio \
+        main.py"
+
+FROM scratch AS export
+COPY --from=builder /src/dist/binance-bot.exe /binance-bot.exe

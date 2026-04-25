@@ -410,6 +410,174 @@ The following directories are mounted as volumes for data persistence:
 - `./charts_output` - Generated charts
 - `./config` - Strategy configurations (read-only)
 
+## Build Standalone Binaries (Docker)
+
+Build single-file PyInstaller binaries for **Linux amd64**, **Linux arm64**,
+and **Windows amd64** without installing Python, PyInstaller, or Wine on your
+host — only Docker is required. Internally `Dockerfile.binary` (Linux) and
+`Dockerfile.binary.windows` (Windows-via-Wine) are driven by `docker buildx`.
+
+### Prerequisites
+
+- Docker Engine 20.10+ with the `buildx` plugin
+- For cross-architecture builds (e.g. building `linux/arm64` on an `amd64`
+  host), register QEMU once:
+
+  ```bash
+  docker run --privileged --rm tonistiigi/binfmt --install all
+  ```
+
+### Build all targets
+
+```bash
+# Linux / macOS / WSL
+bash scripts/build-binaries.sh
+
+# Windows (cmd / PowerShell)
+scripts\build-binaries.bat
+```
+
+Output lands in `./dist/`:
+
+```
+dist/
+├── binance-bot-linux-amd64        # ELF, runs on x86_64 Linux
+├── binance-bot-linux-arm64        # ELF, runs on ARM64 Linux (Raspberry Pi 4/5, AWS Graviton, Apple Silicon under Linux)
+└── binance-bot-windows-amd64.exe  # PE, runs on 64-bit Windows
+```
+
+### Build a single target
+
+```bash
+bash scripts/build-binaries.sh linux/amd64
+bash scripts/build-binaries.sh linux/arm64
+bash scripts/build-binaries.sh windows/amd64
+
+# Or several at once
+bash scripts/build-binaries.sh linux/arm64 windows/amd64
+```
+
+### Run the binary
+
+The binary is self-contained (Python interpreter + all deps embedded). It
+still needs the **`config/`** directory and a **`.env`** file in the working
+directory, plus writable `logs/` and `data/` folders. The simplest layout:
+
+```
+my-bot/
+├── binance-bot-linux-amd64        # the binary
+├── .env                            # your API keys (copy from .env.example)
+├── config/
+│   ├── global_config.json
+│   └── strategies/*.json
+├── logs/                           # auto-created
+└── data/                           # auto-created
+```
+
+#### Linux / macOS
+
+```bash
+# One-time: make it executable
+chmod +x ./binance-bot-linux-amd64
+
+# Web dashboard (real data)
+./binance-bot-linux-amd64 --mode dashboard --port 5000
+
+# Web dashboard (demo data, no API keys needed)
+./binance-bot-linux-amd64 --mode dashboard --port 5000 --demo
+
+# Paper-trade on Binance testnet
+./binance-bot-linux-amd64 --mode paper --strategies btc_conservative
+
+# Live-trade (REAL money)
+./binance-bot-linux-amd64 --mode live --strategies dcr_balanced zec_balanced
+
+# Backtest the last 30 days
+./binance-bot-linux-amd64 --mode backtest --strategies btc_conservative --days 30
+
+# Backtest a fixed window
+./binance-bot-linux-amd64 --mode backtest --strategies all \
+    --start 2024-01-01 --end 2024-06-30
+```
+
+ARM64 (Raspberry Pi, AWS Graviton, etc.) — same commands, just swap the
+binary name:
+
+```bash
+chmod +x ./binance-bot-linux-arm64
+./binance-bot-linux-arm64 --mode dashboard --port 5000
+```
+
+#### Windows
+
+```cmd
+:: Web dashboard
+binance-bot-windows-amd64.exe --mode dashboard --port 5000
+
+:: Paper trading
+binance-bot-windows-amd64.exe --mode paper --strategies btc_conservative
+
+:: Live trading
+binance-bot-windows-amd64.exe --mode live --strategies dcr_balanced
+
+:: Backtest last 30 days
+binance-bot-windows-amd64.exe --mode backtest --strategies btc_conservative --days 30
+```
+
+PowerShell uses the same commands; prefix with `.\` if the binary is in the
+current folder:
+
+```powershell
+.\binance-bot-windows-amd64.exe --mode dashboard --port 5000
+```
+
+### Run the binary as a service
+
+**Linux (systemd)** — drop this into `/etc/systemd/system/binance-bot.service`:
+
+```ini
+[Unit]
+Description=Binance Auto Rebalance Bot
+After=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/opt/binance-bot
+ExecStart=/opt/binance-bot/binance-bot-linux-amd64 --mode live --strategies dcr_balanced
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now binance-bot
+sudo journalctl -u binance-bot -f
+```
+
+**Windows (Task Scheduler)** — `Create Basic Task` → trigger at logon →
+action `Start a program` → program: full path to
+`binance-bot-windows-amd64.exe` → arguments:
+`--mode live --strategies dcr_balanced` → start in: folder containing the
+binary + `config/` + `.env`.
+
+### Notes & limits
+
+- First build downloads base images and compiles wheels under QEMU for
+  arm64 — expect 5–15 minutes. Subsequent builds are layer-cached and fast.
+- The Windows build uses `batonogov/pyinstaller-windows` (Wine + Python on
+  Linux). If it fails on your network, you can build natively on a Windows
+  host with `pip install pyinstaller && pyinstaller --onefile main.py`.
+- Each binary is large (~80–150 MB) because it bundles `numpy`, `pandas`,
+  `matplotlib`, `eventlet`, and `ccxt`. This is expected for PyInstaller
+  one-file builds.
+- The binary reads `config/strategies/*.json` from the **current working
+  directory**, not from a path baked into the executable — so you can
+  swap presets without rebuilding.
+
 ## Configuration
 
 ### Strategy Configuration
@@ -825,7 +993,14 @@ binance-auto-rebalance/
 ├── README.md
 ├── requirements.txt
 ├── Dockerfile
+├── Dockerfile.binary           # Linux PyInstaller binary build
+├── Dockerfile.binary.windows   # Windows .exe build (Wine inside Docker)
 ├── compose.yml
+├── scripts/
+│   ├── setup-docker.sh
+│   ├── setup-docker.bat
+│   ├── build-binaries.sh       # Driver: produces dist/binance-bot-*
+│   └── build-binaries.bat
 ├── config/
 │   ├── strategies/
 │   │   ├── btc_conservative.json
