@@ -435,19 +435,43 @@ Add an `order_placement` block to your strategy JSON:
 | `min_children_per_ladder` | 2 | Floor on splits per ladder. |
 | `max_children_per_ladder` | 15 | Ceiling on splits per ladder. |
 
-A ready-to-run example lives at
-`config/strategies/btc_distribution_example.json`.
+### Ready-to-run presets
+
+| Preset file | Pair | Target capital | Notes |
+|---|---|---|---|
+| `config/strategies/btc_distribution_example.json` | BTCUSDT | flexible | Reference example for the docs above. |
+| `config/strategies/zec_distribution_5k.json` | ZECUSDT | ~5,000 USDT | 8 ladders, `child_order_usdt = 25`, cap 180. |
+
+Drop new presets into `config/strategies/` — every `*.json` in that folder is
+auto-discovered. The strategy *name* you pass to `--strategies` is the file
+name without the `.json` extension.
 
 ### Usage
 
 ```bash
-# Live / paper (testnet) — loop auto-routes to distribution when config enables it
-python main.py --mode live  --strategies btc_distribution_example
-python main.py --mode paper --strategies all
+# --- Single coin -------------------------------------------------------
+# Live (real funds) — one strategy
+python main.py --mode live  --strategies zec_distribution_5k
+
+# Paper (testnet) — one strategy
+python main.py --mode paper --strategies btc_distribution_example
 
 # Backtest (auto-picks 5m interval for distribution strategies)
-python main.py --mode backtest --strategies btc_distribution_example --days 30
+python main.py --mode backtest --strategies zec_distribution_5k --days 30
+
+# --- Multiple coins ----------------------------------------------------
+# Run several presets in the same process (space-separated)
+python main.py --mode live  --strategies btc_distribution_example zec_distribution_5k
+
+# Run every preset in config/strategies/ at once
+python main.py --mode paper --strategies all
+
+# Backtest a basket over a fixed window
+python main.py --mode backtest --strategies btc_distribution_example zec_distribution_5k --days 60
 ```
+
+Each strategy keeps its own ladders, pending queue, and per-symbol open-order
+cap, so multiple coins run independently in the same process.
 
 ### Testing recommendations
 
