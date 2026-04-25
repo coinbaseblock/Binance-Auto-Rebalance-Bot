@@ -22,7 +22,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-DEFAULT_TARGETS=(linux/amd64 linux/arm64 windows/amd64)
+DEFAULT_TARGETS=(windows/amd64 linux/amd64 linux/arm64)
 TARGETS=("$@")
 if [ ${#TARGETS[@]} -eq 0 ]; then
     TARGETS=("${DEFAULT_TARGETS[@]}")

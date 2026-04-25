@@ -18,7 +18,7 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0\.."
 
 set "TARGETS=%*"
-if "%TARGETS%"=="" set "TARGETS=linux/amd64 linux/arm64 windows/amd64"
+if "%TARGETS%"=="" set "TARGETS=windows/amd64 linux/amd64 linux/arm64"
 
 where docker >nul 2>&1 || (echo [err] docker not on PATH & exit /b 1)
 docker buildx version >nul 2>&1 || (echo [err] docker buildx missing & exit /b 1)
