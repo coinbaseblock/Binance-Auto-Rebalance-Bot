@@ -53,6 +53,7 @@ RUN /bin/bash -lc "\
         --hidden-import=dns.versioned \
         --collect-submodules=engineio \
         --collect-submodules=socketio \
+        --collect-all=charset_normalizer \
         main.py"
 
 FROM scratch AS export
