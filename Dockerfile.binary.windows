@@ -10,6 +10,16 @@
 #
 # Output: /binance-bot.exe
 # ----------------------------------------------------------------------------
+# `ta==0.11.0` ships only an sdist on PyPI, so pip has to build it from
+# source. Building under Wine 9 (the version in the base image below) crashes
+# in CPython's `shutil.copyfile`, which calls `KERNEL32.CopyFile2` — a stub
+# Wine 9 has not implemented. Since `ta` is pure Python, we build a
+# `py3-none-any` wheel here on real Linux Python and feed it to the Wine
+# stage via --find-links, so pip never needs to invoke setup.py under Wine.
+FROM python:3.12-slim AS pure-wheels
+RUN pip install --no-cache-dir --upgrade pip wheel \
+ && pip wheel --no-deps --wheel-dir /wheels ta==0.11.0
+
 # Pinned to a specific Python 3.12 patch tag so prebuilt cp312 wheels exist
 # for pandas==2.1.4 / numpy==1.26.2. The :latest tag ships Python 3.13, which
 # has no cp313 wheels for those pins and forces a source build that needs
@@ -19,13 +29,14 @@ FROM batonogov/pyinstaller-windows:python-3.12.2 AS builder
 
 WORKDIR /src
 
+COPY --from=pure-wheels /wheels /wheels
 COPY requirements.txt ./
 COPY . ./
 
 # The base image's `pyinstaller` shim runs PyInstaller via Wine. Note the
 # Windows path separator (`;`) in --add-data.
 RUN /bin/bash -lc "\
-    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir --find-links=/wheels -r requirements.txt && \
     pyinstaller --clean --noconfirm \
         --onefile \
         --name binance-bot \
