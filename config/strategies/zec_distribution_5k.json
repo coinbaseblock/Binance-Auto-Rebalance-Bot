@@ -1,0 +1,40 @@
+{
+  "enabled": true,
+  "name": "ZEC Distribution 5K",
+  "pair": "ZECUSDT",
+  "description": "ZEC distribution mode scaled for ~5000 USDT total capital",
+
+  "ladder_config": {
+    "base_gap": 0.025,
+    "gap_max": 0.95,
+    "ladders": 8,
+    "fibonacci": [1, 1, 2, 3, 5, 8, 13, 21],
+    "unit_size_zec": 0.5
+  },
+
+  "capital_allocation": {
+    "max_allocation_percent": 1.0,
+    "reserve_percent": 0.10
+  },
+
+  "risk_management": {
+    "safety_multiplier": 1.5,
+    "stop_loss_percent": -0.50,
+    "take_profit_percent": 0.25
+  },
+
+  "execution": {
+    "auto_rebalance": true,
+    "rebalance_interval_hours": 12,
+    "min_profit_to_close": 0.005
+  },
+
+  "order_placement": {
+    "mode": "distribution",
+    "child_order_usdt": 25.0,
+    "proximity_percent": 0.02,
+    "max_open_orders_cap": 180,
+    "min_children_per_ladder": 2,
+    "max_children_per_ladder": 12
+  }
+}
