@@ -6,3 +6,8 @@ __pycache__/
 .env
 logs/
 data/historical/
+
+# PyInstaller / binary builds
+dist/
+build/
+*.spec

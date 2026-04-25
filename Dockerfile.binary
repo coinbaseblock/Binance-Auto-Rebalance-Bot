@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1
+# ----------------------------------------------------------------------------
+# Dockerfile.binary — produce a self-contained Linux binary via PyInstaller.
+#
+# Used by scripts/build-binaries.sh with `docker buildx build --platform`
+# to cross-build for both linux/amd64 and linux/arm64.
+#
+#   docker buildx build --platform linux/amd64 -f Dockerfile.binary \
+#       -o type=local,dest=dist/linux-amd64 .
+#   docker buildx build --platform linux/arm64 -f Dockerfile.binary \
+#       -o type=local,dest=dist/linux-arm64 .
+#
+# Output: /binance-bot (single-file executable).
+# ----------------------------------------------------------------------------
+ARG PYTHON_VERSION=3.12
+FROM python:${PYTHON_VERSION}-slim AS builder
+
+WORKDIR /build
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        binutils \
+        zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt \
+ && pip install --no-cache-dir pyinstaller==6.3.0 staticx==0.14.1 || \
+    pip install --no-cache-dir pyinstaller==6.3.0
+
+COPY . ./
+
+# Hidden imports cover dynamic dispatchers used by flask-socketio / eventlet /
+# dnspython that PyInstaller's static analysis misses.
+RUN pyinstaller --clean --noconfirm \
+        --onefile \
+        --name binance-bot \
+        --add-data "src/templates:src/templates" \
+        --hidden-import=engineio.async_drivers.eventlet \
+        --hidden-import=eventlet.hubs.epolls \
+        --hidden-import=eventlet.hubs.kqueue \
+        --hidden-import=eventlet.hubs.selects \
+        --hidden-import=dns \
+        --hidden-import=dns.dnssec \
+        --hidden-import=dns.e164 \
+        --hidden-import=dns.namedict \
+        --hidden-import=dns.tsigkeyring \
+        --hidden-import=dns.update \
+        --hidden-import=dns.versioned \
+        --collect-submodules=engineio \
+        --collect-submodules=socketio \
+        main.py
+
+# Final stage exports the binary only — used with `-o type=local,dest=...`.
+FROM scratch AS export
+COPY --from=builder /build/dist/binance-bot /binance-bot
