@@ -113,62 +113,150 @@ DEMO_PORT=5001
 
 ## Docker Installation
 
-You can also run the bot using Docker Compose.
+You can run the bot via Docker Compose for both single-coin and multi-coin
+setups. Every trading service shares the same image and `.env`, and is
+gated behind a Compose **profile** so containers only start when you ask
+for them.
 
 ### Prerequisites
 
 - Docker Engine 20.10+
-- Docker Compose v2.0+
+- Docker Compose v2.0+ (the `docker compose` plugin, not legacy `docker-compose`)
 
-### Quick Start with Docker
+### One-shot preparation
+
+The `scripts/setup-docker.sh` (Linux/macOS/WSL) and
+`scripts\setup-docker.bat` (Windows) helpers do the boring parts once:
+
+1. Verify Docker + Compose v2 are installed.
+2. Create `logs/`, `data/historical/`, `charts_output/` for volume mounts.
+3. Copy `.env.example` → `.env` if it does not exist yet.
+4. Build the image (`docker compose build`).
+5. Print the list of available profiles.
 
 ```bash
-# Clone repository
-git clone https://github.com/yourusername/binance-auto-rebalance.git
-cd binance-auto-rebalance
+# Linux / macOS / WSL
+bash scripts/setup-docker.sh
 
-# Setup environment
-cp .env.example .env
-# Edit .env with your Binance API keys
+# Windows (cmd or PowerShell)
+scripts\setup-docker.bat
 
-# Start the dashboard (default)
-docker compose up -d dashboard
-
-# Access the dashboard at http://localhost:5000
+# Skip the image build (useful in CI or after edits to .env only)
+bash scripts/setup-docker.sh --no-build
 ```
 
-### Available Services
+After it finishes, **edit `.env`** and fill in `BINANCE_API_KEY` /
+`BINANCE_API_SECRET` before starting any live or paper service.
 
-| Service | Description | Port | Command |
-|---------|-------------|------|---------|
-| `dashboard` | Web dashboard for monitoring | 5000 | `docker compose up dashboard` |
-| `dashboard-demo` | Demo dashboard with sample data | 5001 | `docker compose --profile demo up dashboard-demo` |
-| `paper` | Paper trading (testnet) | - | `docker compose --profile paper up paper` |
-| `live` | Live trading (real money) | - | `docker compose --profile live up live` |
+### Profile cheatsheet
 
-### Docker Build
+All services live in `compose.yml`. None start by default — pick a profile.
+
+| Goal | Profile | Command |
+|---|---|---|
+| Web dashboard (real data) | `dashboard` | `docker compose --profile dashboard up -d` |
+| Web dashboard (demo data) | `demo` | `docker compose --profile demo up -d` |
+| Single coin — paper / testnet | `paper-btc`, `paper-eth`, `paper-bnb`, `paper-dcr`, `paper-zec` | `docker compose --profile paper-btc up -d` |
+| Single coin — LIVE (real money) | `live-btc`, `live-eth`, `live-bnb`, `live-dcr`, `live-zec` | `docker compose --profile live-dcr up -d` |
+| Multi-coin basket — paper | `paper-basket` | `docker compose --profile paper-basket up -d` |
+| Multi-coin basket — LIVE | `live-basket` | `docker compose --profile live-basket up -d` |
+| Custom basket — paper | `paper-custom` | `STRATEGIES="btc_conservative eth_balanced" docker compose --profile paper-custom up -d` |
+| Custom basket — LIVE | `live-custom` | `STRATEGIES="dcr_balanced zec_balanced" docker compose --profile live-custom up -d` |
+| Backtest (one-off) | `backtest` | `docker compose --profile backtest run --rm backtest --strategies btc_conservative --days 30` |
+
+> **Strategy names** match the JSON file names under `config/strategies/`
+> (without the `.json` extension): `btc_conservative`, `eth_balanced`,
+> `bnb_aggressive`, `dcr_balanced`, `zec_balanced`,
+> `btc_distribution_example`, `zec_distribution_5k`. Add a new preset by
+> dropping a JSON file into that folder — `paper-basket` / `live-basket`
+> auto-pick it up via `--strategies all`.
+
+### Single-coin examples
 
 ```bash
-# Option 1: Use the build script (Windows)
-build-docker.bat
+# Paper-trade DCR on testnet (safe — no real funds)
+docker compose --profile paper-dcr up -d
+docker compose logs -f binance-paper-dcr
 
-# Option 2: Disable BuildKit for Windows compatibility
+# Live-trade BTC with the conservative preset (REAL money)
+docker compose --profile live-btc up -d
+docker compose logs -f binance-live-btc
+
+# Stop just that one coin
+docker compose --profile live-btc down
+```
+
+You can run **several single-coin profiles at the same time** because each
+service has its own container name — they share the image and `.env` but
+their state is independent:
+
+```bash
+docker compose --profile live-dcr up -d
+docker compose --profile live-zec up -d
+docker compose ps               # both containers running
+```
+
+### Multi-coin examples
+
+Two ways to run multiple coins:
+
+**A) One container, all enabled strategies** (lighter on resources, one
+log stream):
+
+```bash
+# Paper basket
+docker compose --profile paper-basket up -d
+docker compose logs -f binance-paper-basket
+
+# Live basket
+docker compose --profile live-basket up -d
+```
+
+**B) Custom basket — pick exactly which strategies run together:**
+
+```bash
+# Linux / macOS
+STRATEGIES="btc_conservative eth_balanced dcr_balanced" \
+    docker compose --profile paper-custom up -d
+
+# Windows (cmd)
+set STRATEGIES=btc_conservative eth_balanced dcr_balanced
+docker compose --profile paper-custom up -d
+
+# Windows (PowerShell)
+$env:STRATEGIES = "btc_conservative eth_balanced dcr_balanced"
+docker compose --profile paper-custom up -d
+```
+
+The space-separated list is forwarded to `main.py --strategies`. Each
+strategy keeps its own ladders and per-symbol open-order cap, so running
+several inside one container is functionally the same as running each in
+its own profile.
+
+### Manual Docker build (no Compose)
+
+```bash
+# Linux / macOS
+docker build -t binance-dcr-bot .
+
+# Windows — disable BuildKit if you hit OCI runtime errors
 set DOCKER_BUILDKIT=0
 docker build -t binance-dcr-bot .
-
-# Option 3: Standard build (Linux/macOS)
-docker build -t binance-dcr-bot .
+# or use the helper:
+build-docker.bat
 ```
 
 ### Docker Commands Reference
 
 | Action | Command |
 |--------|---------|
-| Start with Docker Compose | `docker compose up -d` |
-| Stop all services | `docker compose down` |
-| View logs | `docker logs -f <container-name>` |
-| Check running containers | `docker ps --filter "name=binance-"` |
-| Check all containers (including stopped) | `docker ps -a --filter "name=binance-"` |
+| List active profiles | `docker compose config --profiles` |
+| Start a profile | `docker compose --profile <name> up -d` |
+| Stop a profile | `docker compose --profile <name> down` |
+| Stop everything | `docker compose down` |
+| View logs | `docker compose logs -f <service>` |
+| List containers | `docker ps --filter "name=binance-"` |
+| Rebuild after code change | `docker compose build` |
 
 ### Troubleshooting: Container Name Already in Use
 

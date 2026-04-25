@@ -1,114 +1,176 @@
 name: binance-rebalance-bot
 
+# ----------------------------------------------------------------------------
+# Reusable defaults — every trading service inherits from this anchor so the
+# build, env, volumes, and restart policy stay in one place.
+#
+# Usage cheatsheet
+#   docker compose --profile dashboard up -d                  # web UI on :5000
+#   docker compose --profile demo      up -d                  # demo UI on :5001
+#
+#   # Single-coin (paper / testnet)
+#   docker compose --profile paper-btc up -d
+#   docker compose --profile paper-eth up -d
+#   docker compose --profile paper-dcr up -d
+#   docker compose --profile paper-zec up -d
+#   docker compose --profile paper-bnb up -d
+#
+#   # Single-coin (live / real funds — USE WITH CAUTION)
+#   docker compose --profile live-btc  up -d
+#   docker compose --profile live-eth  up -d
+#   docker compose --profile live-dcr  up -d
+#   docker compose --profile live-zec  up -d
+#   docker compose --profile live-bnb  up -d
+#
+#   # Multi-coin baskets (all enabled strategies in one container)
+#   docker compose --profile paper-basket up -d
+#   docker compose --profile live-basket  up -d
+#
+#   # Custom basket — pass STRATEGIES via env (space-separated names without .json)
+#   STRATEGIES="btc_conservative eth_balanced" \
+#       docker compose --profile paper-custom up -d
+#
+#   # Backtest (one-off)
+#   docker compose --profile backtest run --rm backtest \
+#       --strategies btc_conservative --days 30
+# ----------------------------------------------------------------------------
+
+x-bot-base: &bot-base
+  build: .
+  env_file:
+    - .env
+  volumes:
+    - ./logs:/app/logs
+    - ./data:/app/data
+    - ./charts_output:/app/charts_output
+    - ./config:/app/config:ro
+  restart: unless-stopped
+
 services:
-  # Web Dashboard - Real-time monitoring UI
+  # ==========================================================================
+  # Web Dashboard
+  # ==========================================================================
   dashboard:
-    build: .
+    <<: *bot-base
+    container_name: binance-dashboard
     ports:
       - "${DASHBOARD_PORT:-5000}:5000"
-    environment:
-      - BINANCE_API_KEY=${BINANCE_API_KEY}
-      - BINANCE_API_SECRET=${BINANCE_API_SECRET}
-      - BINANCE_TESTNET=${BINANCE_TESTNET:-true}
-      - TOTAL_CAPITAL_USDT=${TOTAL_CAPITAL_USDT:-10000}
-      - MAX_ALLOCATION_PER_COIN=${MAX_ALLOCATION_PER_COIN:-0.20}
-      - STOP_LOSS_PERCENT=${STOP_LOSS_PERCENT:-25}
-      - MAX_CONCURRENT_STRATEGIES=${MAX_CONCURRENT_STRATEGIES:-5}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-    volumes:
-      - ./logs:/app/logs
-      - ./data:/app/data
-      - ./charts_output:/app/charts_output
-      - ./config:/app/config:ro
-    restart: unless-stopped
+    profiles: ["dashboard"]
     command: ["python", "main.py", "--mode", "dashboard", "--port", "5000"]
 
-  # Demo Dashboard - Sample data for testing
   dashboard-demo:
-    build: .
+    <<: *bot-base
+    container_name: binance-dashboard-demo
     ports:
       - "${DEMO_PORT:-5001}:5000"
-    environment:
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-    volumes:
-      - ./logs:/app/logs
-      - ./charts_output:/app/charts_output
-    restart: unless-stopped
-    profiles:
-      - demo
+    profiles: ["demo"]
     command: ["python", "main.py", "--mode", "dashboard", "--demo", "--port", "5000"]
 
-  # Paper Trading Bot - Simulated trading with testnet
-  paper:
-    build: .
-    environment:
-      - BINANCE_API_KEY=${BINANCE_API_KEY}
-      - BINANCE_API_SECRET=${BINANCE_API_SECRET}
-      - BINANCE_TESTNET=true
-      - TOTAL_CAPITAL_USDT=${TOTAL_CAPITAL_USDT:-10000}
-      - MAX_ALLOCATION_PER_COIN=${MAX_ALLOCATION_PER_COIN:-0.20}
-      - STOP_LOSS_PERCENT=${STOP_LOSS_PERCENT:-25}
-      - MAX_CONCURRENT_STRATEGIES=${MAX_CONCURRENT_STRATEGIES:-5}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-    volumes:
-      - ./logs:/app/logs
-      - ./data:/app/data
-      - ./charts_output:/app/charts_output
-      - ./config:/app/config:ro
-    restart: unless-stopped
-    profiles:
-      - paper
+  # ==========================================================================
+  # Single-coin — Paper trading (testnet, no real money)
+  # ==========================================================================
+  paper-btc:
+    <<: *bot-base
+    container_name: binance-paper-btc
+    profiles: ["paper-btc"]
+    command: ["python", "main.py", "--mode", "paper", "--strategies", "btc_conservative"]
+
+  paper-eth:
+    <<: *bot-base
+    container_name: binance-paper-eth
+    profiles: ["paper-eth"]
+    command: ["python", "main.py", "--mode", "paper", "--strategies", "eth_balanced"]
+
+  paper-bnb:
+    <<: *bot-base
+    container_name: binance-paper-bnb
+    profiles: ["paper-bnb"]
+    command: ["python", "main.py", "--mode", "paper", "--strategies", "bnb_aggressive"]
+
+  paper-dcr:
+    <<: *bot-base
+    container_name: binance-paper-dcr
+    profiles: ["paper-dcr"]
+    command: ["python", "main.py", "--mode", "paper", "--strategies", "dcr_balanced"]
+
+  paper-zec:
+    <<: *bot-base
+    container_name: binance-paper-zec
+    profiles: ["paper-zec"]
+    command: ["python", "main.py", "--mode", "paper", "--strategies", "zec_balanced"]
+
+  # ==========================================================================
+  # Single-coin — Live trading (REAL MONEY)
+  # ==========================================================================
+  live-btc:
+    <<: *bot-base
+    container_name: binance-live-btc
+    profiles: ["live-btc"]
+    command: ["python", "main.py", "--mode", "live", "--strategies", "btc_conservative"]
+
+  live-eth:
+    <<: *bot-base
+    container_name: binance-live-eth
+    profiles: ["live-eth"]
+    command: ["python", "main.py", "--mode", "live", "--strategies", "eth_balanced"]
+
+  live-bnb:
+    <<: *bot-base
+    container_name: binance-live-bnb
+    profiles: ["live-bnb"]
+    command: ["python", "main.py", "--mode", "live", "--strategies", "bnb_aggressive"]
+
+  live-dcr:
+    <<: *bot-base
+    container_name: binance-live-dcr
+    profiles: ["live-dcr"]
+    command: ["python", "main.py", "--mode", "live", "--strategies", "dcr_balanced"]
+
+  live-zec:
+    <<: *bot-base
+    container_name: binance-live-zec
+    profiles: ["live-zec"]
+    command: ["python", "main.py", "--mode", "live", "--strategies", "zec_balanced"]
+
+  # ==========================================================================
+  # Multi-coin baskets — all enabled strategies in one container
+  # ==========================================================================
+  paper-basket:
+    <<: *bot-base
+    container_name: binance-paper-basket
+    profiles: ["paper-basket"]
     command: ["python", "main.py", "--mode", "paper", "--strategies", "all"]
 
-  # Live Trading Bot - Real money trading (USE WITH CAUTION!)
-  live:
-    build: .
-    environment:
-      - BINANCE_API_KEY=${BINANCE_API_KEY}
-      - BINANCE_API_SECRET=${BINANCE_API_SECRET}
-      - BINANCE_TESTNET=false
-      - TOTAL_CAPITAL_USDT=${TOTAL_CAPITAL_USDT:-10000}
-      - MAX_ALLOCATION_PER_COIN=${MAX_ALLOCATION_PER_COIN:-0.20}
-      - STOP_LOSS_PERCENT=${STOP_LOSS_PERCENT:-25}
-      - MAX_CONCURRENT_STRATEGIES=${MAX_CONCURRENT_STRATEGIES:-5}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-    volumes:
-      - ./logs:/app/logs
-      - ./data:/app/data
-      - ./charts_output:/app/charts_output
-      - ./config:/app/config:ro
-    restart: unless-stopped
-    profiles:
-      - live
+  live-basket:
+    <<: *bot-base
+    container_name: binance-live-basket
+    profiles: ["live-basket"]
     command: ["python", "main.py", "--mode", "live", "--strategies", "all"]
 
-  # DCR Live Trading - Single coin DCR/USDT trading
-  dcr-live:
-    build: .
-    container_name: binance-dcr-live
-    env_file:
-      - .env
-    environment:
-      - BINANCE_TESTNET=false
-    volumes:
-      - ./logs:/app/logs
-      - ./data:/app/data
-      - ./charts_output:/app/charts_output
-    restart: unless-stopped
-    profiles:
-      - dcr
-    command: ["python", "main.py", "--mode", "live", "--symbol", "DCR/USDT"]
+  # Custom basket — choose your own strategy list via STRATEGIES env var.
+  # Example: STRATEGIES="btc_conservative eth_balanced dcr_balanced"
+  paper-custom:
+    <<: *bot-base
+    container_name: binance-paper-custom
+    profiles: ["paper-custom"]
+    entrypoint: ["/bin/sh", "-c"]
+    command: ['exec python main.py --mode paper --strategies ${STRATEGIES:-all}']
 
-  # DCR Simulation - Test DCR ladder strategy
-  dcr-simulation:
-    build: .
-    container_name: binance-dcr-simulation
-    env_file:
-      - .env
-    volumes:
-      - ./logs:/app/logs
-      - ./data:/app/data
-      - ./charts_output:/app/charts_output
-    profiles:
-      - dcr-sim
-    command: ["python", "simulate_dcr_ladders.py"]
+  live-custom:
+    <<: *bot-base
+    container_name: binance-live-custom
+    profiles: ["live-custom"]
+    entrypoint: ["/bin/sh", "-c"]
+    command: ['exec python main.py --mode live --strategies ${STRATEGIES:-all}']
+
+  # ==========================================================================
+  # Backtest — one-off runner. Pass extra args after `run --rm backtest`.
+  #   docker compose --profile backtest run --rm backtest \
+  #       --strategies btc_conservative --days 30
+  # ==========================================================================
+  backtest:
+    <<: *bot-base
+    container_name: binance-backtest
+    restart: "no"
+    profiles: ["backtest"]
+    entrypoint: ["python", "main.py", "--mode", "backtest"]
