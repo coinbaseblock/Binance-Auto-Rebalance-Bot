@@ -54,6 +54,7 @@ RUN pyinstaller --clean --noconfirm \
         --hidden-import=dns.versioned \
         --collect-submodules=engineio \
         --collect-submodules=socketio \
+        --collect-all=charset_normalizer \
         main.py
 
 # Final stage exports the binary only — used with `-o type=local,dest=...`.
