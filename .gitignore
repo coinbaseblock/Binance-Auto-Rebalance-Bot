@@ -6,6 +6,7 @@ __pycache__/
 .env
 logs/
 data/historical/
+state/
 
 # PyInstaller / binary builds
 dist/
