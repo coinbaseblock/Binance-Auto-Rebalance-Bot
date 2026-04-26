@@ -16,6 +16,7 @@ from src.strategy import Strategy
 from src.portfolio import Portfolio
 from src.order_manager import OrderManager
 from src.martingale import MartingaleCalculator
+from src.state_store import StateStore
 from backtest.backtester import Backtester
 from backtest.data_loader import DataLoader
 from src.web_dashboard import TradingDashboard
@@ -130,6 +131,19 @@ def run_live_trading(args):
     # Initialize components
     client = BinanceClient(testnet=False)
 
+    # Session persistence: state file is per-mode so live and paper don't mix
+    state_path = args.state_file or f"state/bot_state_{args.mode}.json"
+    state_store = StateStore(state_path)
+
+    if args.reset_state:
+        backup = state_store.reset()
+        if backup:
+            logger.info(f"--reset-state: previous state backed up to {backup}")
+        else:
+            logger.info("--reset-state: no existing state file to reset")
+
+    resuming = state_store.exists()
+
     # Get total capital
     balance = client.get_account_balance('USDT')
     total_capital = balance['free']
@@ -141,40 +155,72 @@ def run_live_trading(args):
     # Load strategies
     strategies = load_strategies(args.strategies)
 
-    # Initialize each strategy with current prices
-    for strategy in strategies:
-        current_price = client.get_current_price(strategy.config['pair'])
-        strategy.update_prices(current_price)
-        logger.info(f"Initialized {strategy.config['name']} at ${current_price:.2f}")
+    if resuming:
+        logger.info(f"=== RESUMING SESSION from {state_path} ===")
+        try:
+            saved = state_store.load()
+            state_store.apply(saved, portfolio, order_manager, strategies)
+            logger.info(f"Restored: {len(portfolio.trades_history)} trades, "
+                        f"{len(order_manager.active_orders)} active orders, "
+                        f"realized P&L: ${portfolio.get_realized_pnl():.2f}")
+        except Exception as e:
+            logger.error(f"Failed to load state file: {e}. "
+                         f"Use --reset-state to start fresh, or fix the file.")
+            raise
 
-        # Log all planned ladder levels so user can see the plan
-        order_manager.log_planned_ladders(strategy)
+        # Reconcile with the exchange to catch any fills that happened while offline
+        order_manager.reconcile_with_exchange()
+    else:
+        # Fresh session: initialize each strategy with current prices and place initial orders
+        for strategy in strategies:
+            current_price = client.get_current_price(strategy.config['pair'])
+            strategy.update_prices(current_price)
+            logger.info(f"Initialized {strategy.config['name']} at ${current_price:.2f}")
 
-        # Place initial order(s) based on order_placement.mode
-        if order_manager.is_distribution_mode(strategy):
-            order_manager.log_planned_distribution(strategy)
-            logger.info(f"{strategy.config['name']}: Distribution mode - children will be "
-                       f"placed as price approaches each child price (respecting open-order cap)")
-            order_manager.place_distribution_orders(strategy, current_price)
-        elif order_manager.is_sequential_mode(strategy):
-            logger.info(f"{strategy.config['name']}: Sequential mode - placing first order only, "
-                       f"next orders will be placed as price approaches each level")
-            order_manager.place_next_sequential_order(strategy, current_price)
-        else:
-            order_manager.place_ladder_buy_orders(strategy, current_price)
+            # Log all planned ladder levels so user can see the plan
+            order_manager.log_planned_ladders(strategy)
+
+            # Place initial order(s) based on order_placement.mode
+            if order_manager.is_distribution_mode(strategy):
+                order_manager.log_planned_distribution(strategy)
+                logger.info(f"{strategy.config['name']}: Distribution mode - children will be "
+                           f"placed as price approaches each child price (respecting open-order cap)")
+                order_manager.place_distribution_orders(strategy, current_price)
+            elif order_manager.is_sequential_mode(strategy):
+                logger.info(f"{strategy.config['name']}: Sequential mode - placing first order only, "
+                           f"next orders will be placed as price approaches each level")
+                order_manager.place_next_sequential_order(strategy, current_price)
+            else:
+                order_manager.place_ladder_buy_orders(strategy, current_price)
+
+        # Persist initial state so a crash before the first loop iteration is recoverable
+        try:
+            state_store.save(portfolio, order_manager, strategies)
+        except Exception as e:
+            logger.error(f"Failed to save initial state (continuing): {e}")
 
     # Main trading loop
     logger.info("Starting trading loop...")
     check_interval = 30  # Check more frequently for sequential mode responsiveness
     max_network_backoff = 300  # Cap backoff at 5 minutes
     consecutive_errors = 0
+    current_prices = {}
+
+    def _save_state(label):
+        try:
+            state_store.save(portfolio, order_manager, strategies)
+        except Exception as e:
+            logger.error(f"State save failed ({label}): {e}")
+
     try:
         while True:
+            state_dirty = False
             try:
                 # Check filled orders
                 filled = order_manager.check_filled_orders()
 
                 if filled:
+                    state_dirty = True
                     logger.info(f"Processed {len(filled)} filled orders")
 
                     # Place corresponding sell orders for filled buys
@@ -209,10 +255,13 @@ def run_live_trading(args):
                 # Sequential mode: check if price is approaching next levels
                 for strategy in strategies:
                     cp = current_prices[strategy.config['pair']]
+                    open_before = len(order_manager.active_orders)
                     if order_manager.is_distribution_mode(strategy):
                         order_manager.place_distribution_orders(strategy, cp)
                     elif order_manager.is_sequential_mode(strategy):
                         order_manager.place_next_sequential_order(strategy, cp)
+                    if len(order_manager.active_orders) != open_before:
+                        state_dirty = True
 
                 # Auto-restart: when all positions are closed and no active orders for a strategy
                 for strategy in strategies:
@@ -236,6 +285,11 @@ def run_live_trading(args):
                             order_manager.place_next_sequential_order(strategy, current_price)
                         else:
                             order_manager.place_ladder_buy_orders(strategy, current_price)
+                        state_dirty = True
+
+                # Persist any state changes made this iteration
+                if state_dirty:
+                    _save_state("iteration")
 
                 # Reset error counter on successful iteration
                 consecutive_errors = 0
@@ -257,15 +311,21 @@ def run_live_trading(args):
 
     except KeyboardInterrupt:
         logger.info("\nShutting down gracefully...")
-        order_manager.cancel_all_orders()
-        logger.info("All orders cancelled")
+        # Save state BEFORE cancelling so a resume can decide what to do.
+        # We do not auto-cancel here anymore because the user typically wants
+        # to resume the same session next launch. Use --reset-state plus a
+        # manual cancel on Binance if you really want a clean slate.
+        _save_state("shutdown")
+        logger.info(f"State saved to {state_path}. Resume with the same command "
+                    f"(or pass --reset-state to start fresh).")
 
         # Print final statistics
-        stats = portfolio.get_statistics(current_prices)
-        print(f"\n{'='*60}")
-        print("FINAL STATISTICS")
-        print(f"{'='*60}")
-        print(json.dumps(stats, indent=2))
+        if current_prices:
+            stats = portfolio.get_statistics(current_prices)
+            print(f"\n{'='*60}")
+            print("FINAL STATISTICS")
+            print(f"{'='*60}")
+            print(json.dumps(stats, indent=2))
 
 
 def run_paper_trading(args):
@@ -410,6 +470,14 @@ def main():
                        help='Dashboard web server port (default: 5000)')
     parser.add_argument('--demo', action='store_true',
                        help='Run dashboard in demo mode with sample data')
+    parser.add_argument('--state-file',
+                       help='Path to session state file (default: state/bot_state_<mode>.json). '
+                            'Used by live and paper modes to persist trades, positions, and the '
+                            'distribution / sequential queue across restarts.')
+    parser.add_argument('--reset-state', action='store_true',
+                       help='Discard saved session state before starting (forget previous '
+                            'orders, positions, and P&L). The old state file is renamed to '
+                            '*.reset.<timestamp> as a backup.')
 
     args = parser.parse_args()
 

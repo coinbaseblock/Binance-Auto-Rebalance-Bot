@@ -568,6 +568,58 @@ class OrderManager:
 
         return filled_orders
 
+    def reconcile_with_exchange(self):
+        """Verify saved active_orders against Binance after a restart.
+
+        For each saved order, query the exchange:
+          - FILLED: keep in active_orders so the next check_filled_orders()
+            run picks it up (which records the position and queues a SELL).
+          - CANCELED / EXPIRED / REJECTED: drop. If it was a child BUY, push
+            the child back onto the pending queue so it can be retried.
+          - NEW / PARTIALLY_FILLED: still live, keep.
+          - Anything else (or query error): keep so we don't lose it; the
+            regular loop will pick it up.
+
+        Returns a tuple (kept, missed_fills, dropped).
+        """
+        kept = 0
+        missed_fills = 0
+        dropped = 0
+        for order_id, od in list(self.active_orders.items()):
+            symbol = od["order"].get("symbol")
+            try:
+                status = self.client.client.get_order(symbol=symbol, orderId=order_id)
+            except Exception as e:
+                logger.warning(f"Reconcile: cannot query order {order_id} on {symbol}: {e}; "
+                               f"keeping in active list")
+                kept += 1
+                continue
+
+            s = status.get("status")
+            if s == "FILLED":
+                missed_fills += 1
+                logger.info(f"Reconcile: order {order_id} ({od['type']} L{od['level']}) "
+                            f"filled while offline - will be processed on next check")
+                kept += 1
+            elif s in ("CANCELED", "EXPIRED", "REJECTED", "PENDING_CANCEL"):
+                dropped += 1
+                logger.info(f"Reconcile: order {order_id} ({od['type']} L{od['level']}) "
+                            f"is {s} on exchange; dropping")
+                child = od.get("child")
+                if child is not None and od["type"] == "BUY":
+                    # Put the child back on the pending queue so it can be retried
+                    queue = self._pending_children.setdefault(od["strategy"], [])
+                    child["status"] = "pending"
+                    queue.append(child)
+                    queue.sort(key=lambda c: c["buy_price"], reverse=True)
+                del self.active_orders[order_id]
+            else:
+                kept += 1
+
+        logger.info(f"Reconcile complete: {kept} kept, {missed_fills} missed fills, "
+                    f"{dropped} dropped")
+        return kept, missed_fills, dropped
+
     def cancel_all_orders(self, strategy_name=None):
         """Cancel all active orders (optionally for specific strategy)"""
         cancelled = []
