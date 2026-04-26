@@ -29,6 +29,12 @@ FROM batonogov/pyinstaller-windows:python-3.12.2 AS builder
 
 WORKDIR /src
 
+# Force charset-normalizer to install from sdist as pure Python. Its 3.x binary
+# wheels include a mypyc-compiled `<hash>__mypyc.cp312-win_amd64.pyd` whose
+# random-prefixed name PyInstaller's static analysis cannot resolve, producing
+# `ModuleNotFoundError: No module named '<hash>__mypyc'` at runtime.
+ENV CHARSET_NORMALIZER_USE_MYPYC=0
+
 COPY --from=pure-wheels /wheels /wheels
 COPY requirements.txt ./
 COPY . ./
@@ -36,7 +42,7 @@ COPY . ./
 # The base image's `pyinstaller` shim runs PyInstaller via Wine. Note the
 # Windows path separator (`;`) in --add-data.
 RUN /bin/bash -lc "\
-    pip install --no-cache-dir --find-links=/wheels -r requirements.txt && \
+    pip install --no-cache-dir --find-links=/wheels --no-binary=charset-normalizer -r requirements.txt && \
     pyinstaller --clean --noconfirm \
         --onefile \
         --name binance-bot \
@@ -54,6 +60,7 @@ RUN /bin/bash -lc "\
         --collect-submodules=engineio \
         --collect-submodules=socketio \
         --collect-all=charset_normalizer \
+        --collect-all=chardet \
         main.py"
 
 FROM scratch AS export
