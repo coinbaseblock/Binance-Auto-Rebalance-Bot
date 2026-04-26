@@ -7,7 +7,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import requests.exceptions
 
@@ -20,13 +20,23 @@ from backtest.backtester import Backtester
 from backtest.data_loader import DataLoader
 from src.web_dashboard import TradingDashboard
 
+# Force UTF-8 on stdout/stderr so log messages containing Unicode (e.g. the
+# "→" arrow in date-range messages) don't blow up on Windows consoles whose
+# default codepage is cp1252. errors='replace' is a safety net in case the
+# stream can't be reconfigured (e.g. when stdout is not a real TTY).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError):
+        pass
+
 # Setup logging
 Path('logs').mkdir(exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('logs/bot.log'),
+        logging.FileHandler('logs/bot.log', encoding='utf-8'),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -69,7 +79,7 @@ def run_backtest(args):
     # Resolve the date range: --days N takes precedence and runs N days back
     # from today; otherwise fall back to --start / --end.
     if args.days is not None:
-        end_dt = datetime.utcnow()
+        end_dt = datetime.now(timezone.utc)
         start_dt = end_dt - timedelta(days=int(args.days))
         start_date = start_dt.strftime('%Y-%m-%d')
         end_date = end_dt.strftime('%Y-%m-%d')
