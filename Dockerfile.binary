@@ -20,7 +20,8 @@ WORKDIR /build
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    CHARSET_NORMALIZER_USE_MYPYC=0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -29,7 +30,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt \
+# Force charset-normalizer to install from sdist (with mypyc disabled above).
+# The binary wheels ship a mypyc-compiled extension whose name embeds a random
+# hash; PyInstaller's static analysis misses it and the resulting executable
+# crashes at import with `No module named '<hash>__mypyc'`.
+RUN pip install --no-cache-dir --no-binary=charset-normalizer -r requirements.txt \
  && pip install --no-cache-dir pyinstaller==6.3.0 staticx==0.14.1 || \
     pip install --no-cache-dir pyinstaller==6.3.0
 
@@ -55,6 +60,7 @@ RUN pyinstaller --clean --noconfirm \
         --collect-submodules=engineio \
         --collect-submodules=socketio \
         --collect-all=charset_normalizer \
+        --collect-all=chardet \
         main.py
 
 # Final stage exports the binary only — used with `-o type=local,dest=...`.
