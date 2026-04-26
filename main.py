@@ -21,6 +21,7 @@ from backtest.data_loader import DataLoader
 from src.web_dashboard import TradingDashboard
 
 # Setup logging
+Path('logs').mkdir(exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -403,7 +404,6 @@ def main():
     args = parser.parse_args()
 
     # Create necessary directories
-    Path('logs').mkdir(exist_ok=True)
     Path('data/historical').mkdir(parents=True, exist_ok=True)
 
     # Run appropriate mode
