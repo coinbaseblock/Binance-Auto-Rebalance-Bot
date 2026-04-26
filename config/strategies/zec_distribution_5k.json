@@ -5,8 +5,8 @@
   "description": "ZEC distribution mode scaled for ~5000 USDT total capital",
 
   "ladder_config": {
-    "base_gap": 0.025,
-    "gap_max": 0.95,
+    "base_gap": 0.04,
+    "gap_max": 0.60,
     "ladders": 8,
     "fibonacci": [1, 1, 2, 3, 5, 8, 13, 21],
     "unit_size_zec": 0.5
