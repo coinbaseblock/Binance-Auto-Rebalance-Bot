@@ -2,8 +2,10 @@
 Main Entry Point for Binance Auto Rebalance Bot
 """
 import argparse
+import atexit
 import logging
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -169,9 +171,10 @@ def run_live_trading(args):
             raise
 
         # Reconcile with the exchange to catch any fills that happened while offline
-        order_manager.reconcile_with_exchange()
+        # AND to detect orphan orders (placed but never recorded due to a mid-flight crash).
+        order_manager.reconcile_with_exchange(strategies=strategies)
     else:
-        # Fresh session: initialize each strategy with current prices and place initial orders
+        # Fresh session: initialize each strategy with current prices.
         for strategy in strategies:
             current_price = client.get_current_price(strategy.config['pair'])
             strategy.update_prices(current_price)
@@ -179,10 +182,22 @@ def run_live_trading(args):
 
             # Log all planned ladder levels so user can see the plan
             order_manager.log_planned_ladders(strategy)
-
-            # Place initial order(s) based on order_placement.mode
             if order_manager.is_distribution_mode(strategy):
                 order_manager.log_planned_distribution(strategy)
+
+        # Persist marker state BEFORE placing any orders. If we crash between an
+        # API call and recording the response, on next start `resuming` will be
+        # True and reconcile_with_exchange() will adopt orphan orders from the
+        # exchange rather than re-placing duplicates.
+        try:
+            state_store.save(portfolio, order_manager, strategies)
+        except Exception as e:
+            logger.error(f"Failed to save initial state (continuing): {e}")
+
+        # Now place initial order(s) based on order_placement.mode
+        for strategy in strategies:
+            current_price = client.get_current_price(strategy.config['pair'])
+            if order_manager.is_distribution_mode(strategy):
                 logger.info(f"{strategy.config['name']}: Distribution mode - children will be "
                            f"placed as price approaches each child price (respecting open-order cap)")
                 order_manager.place_distribution_orders(strategy, current_price)
@@ -193,7 +208,7 @@ def run_live_trading(args):
             else:
                 order_manager.place_ladder_buy_orders(strategy, current_price)
 
-        # Persist initial state so a crash before the first loop iteration is recoverable
+        # Persist again now that orders have been placed
         try:
             state_store.save(portfolio, order_manager, strategies)
         except Exception as e:
@@ -212,7 +227,53 @@ def run_live_trading(args):
         except Exception as e:
             logger.error(f"State save failed ({label}): {e}")
 
+    # --- Crash-safe shutdown wiring ---------------------------------------
+    # Save on any path the OS gives us a chance to handle: SIGTERM (taskkill,
+    # docker stop, systemd), SIGBREAK (Windows console close / Ctrl+Break),
+    # and atexit (any normal interpreter shutdown). Hard power loss can't be
+    # caught here — that case relies on the per-iteration save plus
+    # reconcile_with_exchange() on the next start.
+    _shutdown_saved = {"done": False}
+
+    def _atexit_save():
+        if _shutdown_saved["done"]:
+            return
+        _shutdown_saved["done"] = True
+        logger.info("atexit: saving session state...")
+        _save_state("atexit")
+
+    def _signal_save_and_exit(signum, frame):
+        # Re-raise as KeyboardInterrupt so the existing try/except path runs
+        # the same shutdown logic (including a final save + log).
+        signame = getattr(signal, "Signals", None)
+        try:
+            label = signal.Signals(signum).name
+        except Exception:
+            label = str(signum)
+        logger.info(f"Received signal {label}; initiating graceful shutdown")
+        _save_state(f"signal-{label}")
+        _shutdown_saved["done"] = True
+        # Convert to KeyboardInterrupt to flow into the unified shutdown path.
+        raise KeyboardInterrupt()
+
+    atexit.register(_atexit_save)
+    # SIGTERM is sent by `taskkill <pid>` (no /F), `docker stop`, systemd, etc.
     try:
+        signal.signal(signal.SIGTERM, _signal_save_and_exit)
+    except (AttributeError, ValueError):
+        pass
+    # SIGBREAK fires on Windows console Ctrl+Break and (best-effort) on
+    # console-window close. Available only on Windows.
+    if hasattr(signal, "SIGBREAK"):
+        try:
+            signal.signal(signal.SIGBREAK, _signal_save_and_exit)
+        except (ValueError, OSError):
+            pass
+
+    try:
+        last_heartbeat_save = time.time()
+        heartbeat_interval = 60  # Force a checkpoint at least once per minute
+
         while True:
             state_dirty = False
             try:
@@ -287,9 +348,16 @@ def run_live_trading(args):
                             order_manager.place_ladder_buy_orders(strategy, current_price)
                         state_dirty = True
 
-                # Persist any state changes made this iteration
+                # Persist on any state change OR at least once per heartbeat
+                # interval, so an unexpected shutdown (power loss, force-kill)
+                # never loses more than ~heartbeat_interval seconds of progress.
+                now_ts = time.time()
                 if state_dirty:
                     _save_state("iteration")
+                    last_heartbeat_save = now_ts
+                elif now_ts - last_heartbeat_save >= heartbeat_interval:
+                    _save_state("heartbeat")
+                    last_heartbeat_save = now_ts
 
                 # Reset error counter on successful iteration
                 consecutive_errors = 0

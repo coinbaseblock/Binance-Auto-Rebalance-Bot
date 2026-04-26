@@ -287,6 +287,31 @@ class OrderManager:
                        f"sell @ ${top['sell_price']:.4f} | "
                        f"total ${sum(c['usdt_cost'] for c in children):.2f}")
 
+    def prime_distribution_queue(self, strategy):
+        """Build the pending-children queue (no order placement). Idempotent —
+        a no-op when the queue is already populated (e.g. restored from saved
+        state). Used by reconcile so orphan orders can be matched to children.
+        """
+        if not self.is_distribution_mode(strategy):
+            return
+        strategy_name = strategy.config['name']
+        if strategy_name in self._pending_children:
+            return
+
+        queue = []
+        all_children = strategy.calculate_all_child_orders()
+        for ladder in strategy.get_pending_ladders():
+            ladder_children = all_children.get(ladder['level'], [])
+            ladder['children_total'] = len(ladder_children)
+            ladder.setdefault('children_closed', 0)
+            ladder.setdefault('children_placed', 0)
+            for child in ladder_children:
+                child['parent_ladder'] = ladder
+            queue.extend(ladder_children)
+        queue.sort(key=lambda c: c['buy_price'], reverse=True)
+        self._pending_children[strategy_name] = queue
+        logger.info(f"[{strategy_name}] Distribution queue initialized with {len(queue)} children")
+
     def place_distribution_orders(self, strategy, current_price):
         """Entry point for distribution mode: build pending queue (if empty)
         and promote children whose price is near the market and that fit within
@@ -295,27 +320,7 @@ class OrderManager:
         Returns list of orders placed this call (may be empty when nothing is
         yet in proximity).
         """
-        strategy_name = strategy.config['name']
-
-        # Build the pending queue on first call (or after reset)
-        if strategy_name not in self._pending_children:
-            queue = []
-            all_children = strategy.calculate_all_child_orders()
-            for ladder in strategy.get_pending_ladders():
-                ladder_children = all_children.get(ladder['level'], [])
-                # Store a reference back to the parent ladder on each child so
-                # we can update ladder state when children close.
-                ladder['children_total'] = len(ladder_children)
-                ladder['children_closed'] = 0
-                ladder['children_placed'] = 0
-                for child in ladder_children:
-                    child['parent_ladder'] = ladder
-                queue.extend(ladder_children)
-            # Sort by buy_price descending so the top (closest to market) promotes first
-            queue.sort(key=lambda c: c['buy_price'], reverse=True)
-            self._pending_children[strategy_name] = queue
-            logger.info(f"[{strategy_name}] Distribution queue initialized with {len(queue)} children")
-
+        self.prime_distribution_queue(strategy)
         return self._promote_pending_children(strategy, current_price)
 
     def _promote_pending_children(self, strategy, current_price):
@@ -568,7 +573,7 @@ class OrderManager:
 
         return filled_orders
 
-    def reconcile_with_exchange(self):
+    def reconcile_with_exchange(self, strategies=None):
         """Verify saved active_orders against Binance after a restart.
 
         For each saved order, query the exchange:
@@ -579,6 +584,13 @@ class OrderManager:
           - NEW / PARTIALLY_FILLED: still live, keep.
           - Anything else (or query error): keep so we don't lose it; the
             regular loop will pick it up.
+
+        If `strategies` is supplied, also scan all open orders on the exchange
+        for each strategy symbol and adopt any orphan orders that exist on
+        Binance but are missing from our state file. This protects against the
+        crash window between create_limit_order() succeeding on Binance and
+        the bot recording the response in active_orders (e.g. a hard power
+        loss between the API call and the next state save).
 
         Returns a tuple (kept, missed_fills, dropped).
         """
@@ -618,7 +630,128 @@ class OrderManager:
 
         logger.info(f"Reconcile complete: {kept} kept, {missed_fills} missed fills, "
                     f"{dropped} dropped")
+
+        if strategies:
+            adopted, unmatched = self._reconcile_orphan_orders(strategies)
+            if adopted or unmatched:
+                logger.info(f"Reconcile orphans: {adopted} adopted, {unmatched} unmatched warnings")
+
         return kept, missed_fills, dropped
+
+    def _reconcile_orphan_orders(self, strategies):
+        """Fetch open orders on Binance for each strategy symbol; for any that
+        are not already in active_orders, try to match them back to a pending
+        child or planned ladder. Adopt matches; warn loudly about unmatched
+        orders so the user can manually cancel duplicates.
+
+        Returns (adopted_count, unmatched_count).
+        """
+        adopted = 0
+        unmatched = 0
+        known_ids = {str(oid) for oid in self.active_orders.keys()}
+
+        # Prime distribution queues so orphan child BUYs can be matched. This
+        # is a no-op for already-populated queues (resumed from saved state).
+        for strat in strategies:
+            try:
+                self.prime_distribution_queue(strat)
+            except Exception as e:
+                logger.warning(f"Reconcile orphans: cannot prime distribution queue "
+                               f"for {strat.config['name']}: {e}")
+
+        # Group strategies by symbol so we only query each symbol once.
+        symbol_to_strategies = {}
+        for strat in strategies:
+            symbol = strat.config['pair']
+            symbol_to_strategies.setdefault(symbol, []).append(strat)
+
+        for symbol, strats in symbol_to_strategies.items():
+            try:
+                exchange_orders = self.client.get_open_orders(symbol=symbol)
+            except Exception as e:
+                logger.warning(f"Reconcile orphans: cannot fetch open orders for {symbol}: {e}")
+                continue
+
+            for ex_order in exchange_orders:
+                ex_id = str(ex_order.get('orderId'))
+                if ex_id in known_ids:
+                    continue
+
+                if self._try_adopt_orphan(ex_order, strats):
+                    adopted += 1
+                    known_ids.add(ex_id)
+                else:
+                    unmatched += 1
+                    logger.warning(
+                        f"Orphan order on Binance for {symbol}: id={ex_id} "
+                        f"{ex_order.get('side')} qty={ex_order.get('origQty')} "
+                        f"@ ${float(ex_order.get('price', 0)):.4f}. "
+                        f"Not in saved state and could not be matched to a planned level. "
+                        f"Manually cancel on Binance if this is a stale duplicate."
+                    )
+
+        return adopted, unmatched
+
+    def _try_adopt_orphan(self, ex_order, strategies):
+        """Match an orphan exchange order to a pending child / planned ladder
+        by side + price (within a small tolerance). On match, register it in
+        active_orders so the loop will pick it up. Returns True if adopted."""
+        side = ex_order.get('side')
+        ex_price = float(ex_order.get('price', 0) or 0)
+        if ex_price <= 0:
+            return False
+        # 0.5% tolerance to absorb rounding when the bot rounds prices to the
+        # exchange tick size before placing the order.
+        price_tol = max(ex_price * 0.005, 1e-8)
+
+        for strategy in strategies:
+            # 1) Match against pending children (distribution mode BUY orders)
+            if side == 'BUY':
+                queue = self._pending_children.get(strategy.config['name'], [])
+                for child in list(queue):
+                    if abs(child['buy_price'] - ex_price) <= price_tol:
+                        parent_ladder = child['parent_ladder']
+                        order_id = ex_order.get('orderId')
+                        self.active_orders[order_id] = {
+                            'strategy': strategy.config['name'],
+                            'level': child['parent_level'],
+                            'type': 'BUY',
+                            'order': ex_order,
+                            'ladder': parent_ladder,
+                            'child': child,
+                        }
+                        child['status'] = 'placed'
+                        parent_ladder['children_placed'] = parent_ladder.get('children_placed', 0) + 1
+                        queue.remove(child)
+                        logger.info(
+                            f"Adopted orphan child BUY: {strategy.config['name']} "
+                            f"L{child['parent_level']}.{child['idx']} @ ${ex_price:.4f} "
+                            f"(orderId={order_id})"
+                        )
+                        return True
+
+            # 2) Match against ladder-level buy/sell prices (sequential or plain mode,
+            #    or a SELL placed for a filled child that we missed recording)
+            for ladder in strategy.ladders:
+                target_price = ladder.get('buy_price' if side == 'BUY' else 'sell_price')
+                if not target_price or target_price <= 0:
+                    continue
+                if abs(target_price - ex_price) <= price_tol:
+                    order_id = ex_order.get('orderId')
+                    self.active_orders[order_id] = {
+                        'strategy': strategy.config['name'],
+                        'level': ladder['level'],
+                        'type': side,
+                        'order': ex_order,
+                        'ladder': ladder,
+                    }
+                    logger.info(
+                        f"Adopted orphan {side}: {strategy.config['name']} "
+                        f"L{ladder['level']} @ ${ex_price:.4f} (orderId={order_id})"
+                    )
+                    return True
+
+        return False
 
     def cancel_all_orders(self, strategy_name=None):
         """Cancel all active orders (optionally for specific strategy)"""
