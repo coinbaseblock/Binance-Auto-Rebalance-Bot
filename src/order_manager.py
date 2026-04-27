@@ -284,7 +284,7 @@ class OrderManager:
             bot = children[-1]
             logger.info(f"  Level {level:>3}: {len(children)} children | "
                        f"top ${top['buy_price']:.4f} → bot ${bot['buy_price']:.4f} | "
-                       f"sell @ ${top['sell_price']:.4f} | "
+                       f"sells ${top['sell_price']:.4f} → ${bot['sell_price']:.4f} | "
                        f"total ${sum(c['usdt_cost'] for c in children):.2f}")
 
     def prime_distribution_queue(self, strategy):
@@ -430,15 +430,23 @@ class OrderManager:
             return None
 
     def _place_child_sell(self, strategy, child, parent_ladder, filled_qty):
-        """Place child SELL at parent ladder's sell_price (hybrid pairing)."""
+        """Place child SELL at the child's own sell_price.
+
+        The child's sell_price is computed by Strategy.calculate_child_orders()
+        according to the configured child_sell_mode (default: min of the
+        per-child take-profit and the parent ladder's planned exit). Falls
+        back to the parent ladder's sell_price for legacy state files where
+        the child dict was created before per-child sells existed.
+        """
         strategy_name = strategy.config['name']
         symbol = strategy.config['pair']
+        sell_price = child.get('sell_price') or parent_ladder['sell_price']
         try:
             order = self.client.create_limit_order(
                 symbol=symbol,
                 side='SELL',
                 quantity=filled_qty,
-                price=parent_ladder['sell_price']
+                price=sell_price
             )
             self.active_orders[order['orderId']] = {
                 'strategy': strategy_name,
@@ -450,7 +458,7 @@ class OrderManager:
             }
             child['status'] = 'active'
             logger.info(f"[{strategy_name}] Child SELL placed: L{child['parent_level']}.{child['idx']} "
-                       f"@ ${parent_ladder['sell_price']:.4f}")
+                       f"@ ${sell_price:.4f}")
             return order
         except Exception as e:
             logger.error(f"[{strategy_name}] Failed to place child SELL "
