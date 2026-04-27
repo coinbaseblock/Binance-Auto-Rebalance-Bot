@@ -130,7 +130,21 @@ class Strategy:
         return sum(ladder['usdt_cost'] for ladder in self.ladders)
 
     def get_distribution_config(self):
-        """Return distribution-mode config with defaults applied."""
+        """Return distribution-mode config with defaults applied.
+
+        spread_mode controls how child buy prices are spaced across a ladder:
+          - "geometric" (default): equal percentage gap between adjacent children
+            (evenly distributed in log space — recommended)
+          - "linear": equal absolute USDT gap between adjacent children
+          - "fibonacci": legacy log-Fibonacci weighting (causes top-cluster)
+
+        child_sell_mode controls each child's take-profit price:
+          - "min_of_both" (default): min(child_buy * (1 + child_profit_percent),
+            parent_ladder.sell_price). Closes small lots quickly on small
+            bounces while still respecting the planned ladder exit.
+          - "ladder": every child shares parent_ladder.sell_price (legacy).
+          - "child_only": each child uses its own buy_price * (1 + profit).
+        """
         placement = self.config.get('order_placement', {})
         return {
             'child_order_usdt': placement.get('child_order_usdt', 20.0),
@@ -138,6 +152,9 @@ class Strategy:
             'max_open_orders_cap': placement.get('max_open_orders_cap', 180),
             'min_children_per_ladder': placement.get('min_children_per_ladder', 2),
             'max_children_per_ladder': placement.get('max_children_per_ladder', 15),
+            'spread_mode': placement.get('spread_mode', 'geometric'),
+            'child_profit_percent': placement.get('child_profit_percent', 0.012),
+            'child_sell_mode': placement.get('child_sell_mode', 'min_of_both'),
         }
 
     def is_distribution_mode(self):
@@ -145,15 +162,18 @@ class Strategy:
         return self.config.get('order_placement', {}).get('mode') == 'distribution'
 
     def calculate_child_orders(self, ladder, next_ladder_buy_price=None):
-        """Split a ladder into N child orders mimicking the main ladder's shape.
+        """Split a ladder into N child orders.
 
-        Design (matches the main ladder's Fibonacci + compound-gap pattern):
-          - Price spacing: compound multiplicative gaps, Fibonacci-weighted,
-            so children sit denser near the top and spread out toward the bottom.
-          - Sizing: Fibonacci-weighted USDT per child (deeper children carry more),
-            summing exactly to the parent ladder's usdt_cost.
-          - Sell price: all children share ladder['sell_price'] (hybrid pairing),
-            preserving the planned profit: deeper children also earn extra.
+        Three knobs control the shape (see get_distribution_config):
+          - spread_mode: how child buy prices are spaced across the level's
+            range. Default "geometric" gives evenly-spaced children (equal %
+            gap), avoiding the top-cluster of the legacy Fibonacci weighting.
+          - Sizing: Fibonacci-weighted USDT per child (deeper children carry
+            more) summing exactly to the parent ladder's usdt_cost.
+          - child_sell_mode: each child's take-profit. Default "min_of_both"
+            uses the closer of (child_buy × (1 + child_profit_percent)) and
+            the parent ladder's planned sell. This lets small lots close on
+            small bounces while preserving the planned ladder exit.
 
         The child price range is [next_ladder_buy_price, ladder['buy_price']].
         For the deepest ladder (no next), we extrapolate using the ladder's own
@@ -172,12 +192,26 @@ class Strategy:
         target_size = cfg['child_order_usdt']
         min_n = max(1, int(cfg['min_children_per_ladder']))
         max_n = max(min_n, int(cfg['max_children_per_ladder']))
+        spread_mode = cfg['spread_mode']
+        child_profit = max(0.0, float(cfg['child_profit_percent']))
+        child_sell_mode = cfg['child_sell_mode']
 
         top_price = ladder['buy_price']
         total_usdt = ladder['usdt_cost']
+        ladder_sell = ladder['sell_price']
 
         if top_price <= 0 or total_usdt <= 0:
             return []
+
+        def child_sell_for(buy_price):
+            """Resolve a child's sell price under the active child_sell_mode."""
+            if child_sell_mode == 'ladder':
+                return ladder_sell
+            if child_sell_mode == 'child_only':
+                return buy_price * (1.0 + child_profit)
+            # default: 'min_of_both' — close small lots fast on tiny bounces
+            # but never above the planned ladder exit.
+            return min(buy_price * (1.0 + child_profit), ladder_sell)
 
         # Lower bound of the child range
         if next_ladder_buy_price is not None and next_ladder_buy_price > 0:
@@ -193,7 +227,7 @@ class Strategy:
                 'idx': 0,
                 'parent_level': ladder['level'],
                 'buy_price': top_price,
-                'sell_price': ladder['sell_price'],
+                'sell_price': child_sell_for(top_price),
                 'usdt_cost': total_usdt,
                 'qty': total_usdt / top_price,
                 'status': 'pending',
@@ -211,33 +245,51 @@ class Strategy:
                 'idx': 0,
                 'parent_level': ladder['level'],
                 'buy_price': top_price,
-                'sell_price': ladder['sell_price'],
+                'sell_price': child_sell_for(top_price),
                 'usdt_cost': total_usdt,
                 'qty': total_usdt / top_price,
                 'status': 'pending',
             }]
 
+        # Price spacing: pick the strategy. All three end at bottom_price after n
+        # steps and are sorted top-first.
+        if spread_mode == 'linear':
+            step = (top_price - bottom_price) / n
+            child_prices = [top_price - step * (i + 1) for i in range(n)]
+        elif spread_mode == 'fibonacci':
+            # Legacy: log-Fibonacci weighting (clusters children near the top).
+            fib_p = _generate_fibonacci(n)
+            fib_total_p = float(sum(fib_p))
+            full_drop_ratio = 1.0 - (bottom_price / top_price)
+            target_log = -math.log(1.0 - full_drop_ratio)
+            log_gaps = [target_log * (w / fib_total_p) for w in fib_p]
+            child_prices = []
+            cumulative_mult = 1.0
+            for i in range(n):
+                cumulative_mult *= math.exp(-log_gaps[i])
+                child_prices.append(top_price * cumulative_mult)
+        else:
+            # 'geometric' (default): constant ratio between adjacent children
+            # — evenly spaced in log space.
+            ratio = (bottom_price / top_price) ** (1.0 / n)
+            child_prices = [top_price * (ratio ** (i + 1)) for i in range(n)]
+
+        # Sizing: keep Fibonacci-weighted USDT (deeper children carry more,
+        # totaling exactly the parent's usdt_cost). This is independent of
+        # the price spacing choice.
         fib = _generate_fibonacci(n)
         fib_total = float(sum(fib))
 
-        # Distribute the total drop log-linearly using Fibonacci weights so
-        # the cumulative product of (1 - gap_i) exactly hits bottom/top.
-        full_drop_ratio = 1.0 - (bottom_price / top_price)
-        target_log = -math.log(1.0 - full_drop_ratio)
-        log_gaps = [target_log * (w / fib_total) for w in fib]
-
         children = []
-        cumulative_mult = 1.0
         for i in range(n):
-            cumulative_mult *= math.exp(-log_gaps[i])
-            child_price = top_price * cumulative_mult
+            child_price = child_prices[i]
             child_usdt = total_usdt * (fib[i] / fib_total)
             child_qty = child_usdt / child_price if child_price > 0 else 0
             children.append({
                 'idx': i,
                 'parent_level': ladder['level'],
                 'buy_price': child_price,
-                'sell_price': ladder['sell_price'],
+                'sell_price': child_sell_for(child_price),
                 'usdt_cost': child_usdt,
                 'qty': child_qty,
                 'status': 'pending',

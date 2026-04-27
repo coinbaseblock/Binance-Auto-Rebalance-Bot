@@ -184,7 +184,7 @@ class Backtester:
 
             # 3. Check child SELL fills (limit sell fills when candle high crosses)
             for child in list(active_sells):
-                sell_price = child['parent_ladder']['sell_price']
+                sell_price = child.get('sell_price') or child['parent_ladder']['sell_price']
                 if high_price >= sell_price:
                     revenue = child['qty'] * sell_price
                     fee = revenue * 0.001

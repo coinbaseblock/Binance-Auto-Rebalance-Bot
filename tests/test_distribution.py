@@ -92,12 +92,87 @@ class TestCalculateChildOrders:
         assert children[0]['buy_price'] <= top
         assert children[-1]['buy_price'] >= next_buy - 1e-6
 
-    def test_hybrid_sell_price(self, strategy):
+    def test_default_sell_price_min_of_both(self, strategy):
+        """Default child_sell_mode is 'min_of_both': each child's sell is at
+        most the parent ladder's planned exit, and at most child_buy *
+        (1 + child_profit_percent). Deep children should sell BELOW the
+        parent ladder's sell_price so small bounces close them quickly."""
+        cfg = strategy.get_distribution_config()
+        profit = cfg['child_profit_percent']
         ladder = strategy.ladders[2]
         next_buy = strategy.ladders[3]['buy_price']
         children = strategy.calculate_child_orders(ladder, next_buy)
+        assert len(children) >= 2
         for c in children:
-            assert c['sell_price'] == ladder['sell_price']
+            expected = min(c['buy_price'] * (1 + profit), ladder['sell_price'])
+            assert c['sell_price'] == pytest.approx(expected)
+            assert c['sell_price'] <= ladder['sell_price']
+        # Deepest child should benefit from the per-child cap (its buy is
+        # well below ladder.sell_price, so it sells earlier on a bounce).
+        assert children[-1]['sell_price'] < ladder['sell_price']
+
+    def test_legacy_ladder_sell_mode(self, distribution_config):
+        """Opting into child_sell_mode='ladder' restores the legacy hybrid
+        pairing where every child shares the parent ladder's sell_price."""
+        distribution_config['order_placement']['child_sell_mode'] = 'ladder'
+        path = _write_config(distribution_config)
+        try:
+            s = Strategy(path)
+            s.update_prices(50000.0)
+            ladder = s.ladders[2]
+            next_buy = s.ladders[3]['buy_price']
+            children = s.calculate_child_orders(ladder, next_buy)
+            for c in children:
+                assert c['sell_price'] == ladder['sell_price']
+        finally:
+            os.unlink(path)
+
+    def test_geometric_spread_is_evenly_spaced(self, distribution_config):
+        """Default 'geometric' spread should give roughly constant ratio
+        between adjacent child prices — no top-cluster like the legacy
+        Fibonacci weighting."""
+        # Use a tight ladder range and many children to make the contrast clear
+        distribution_config['order_placement']['child_order_usdt'] = 5.0
+        distribution_config['order_placement']['min_children_per_ladder'] = 6
+        distribution_config['order_placement']['max_children_per_ladder'] = 6
+        path = _write_config(distribution_config)
+        try:
+            s = Strategy(path)
+            s.update_prices(50000.0)
+            ladder = s.ladders[1]
+            next_buy = s.ladders[2]['buy_price']
+            children = s.calculate_child_orders(ladder, next_buy)
+            assert len(children) == 6
+            ratios = [
+                children[i + 1]['buy_price'] / children[i]['buy_price']
+                for i in range(len(children) - 1)
+            ]
+            # All ratios should be equal under geometric spacing
+            for r in ratios:
+                assert r == pytest.approx(ratios[0], rel=1e-6)
+        finally:
+            os.unlink(path)
+
+    def test_fibonacci_spread_mode_legacy(self, distribution_config):
+        """spread_mode='fibonacci' restores the legacy log-Fibonacci weighting
+        (children clustered near the top)."""
+        distribution_config['order_placement']['spread_mode'] = 'fibonacci'
+        distribution_config['order_placement']['child_order_usdt'] = 5.0
+        distribution_config['order_placement']['min_children_per_ladder'] = 6
+        distribution_config['order_placement']['max_children_per_ladder'] = 6
+        path = _write_config(distribution_config)
+        try:
+            s = Strategy(path)
+            s.update_prices(50000.0)
+            ladder = s.ladders[1]
+            next_buy = s.ladders[2]['buy_price']
+            children = s.calculate_child_orders(ladder, next_buy)
+            # First gap (top) should be much smaller than last gap (bottom)
+            first_gap = children[0]['buy_price'] - children[1]['buy_price']
+            last_gap = children[-2]['buy_price'] - children[-1]['buy_price']
+            assert last_gap > first_gap * 3  # heavy weighting at the bottom
+        finally:
+            os.unlink(path)
 
     def test_fibonacci_weighted_sizing(self, strategy):
         """Deeper children should carry larger USDT (martingale-like)."""
