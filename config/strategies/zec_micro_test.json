@@ -1,0 +1,47 @@
+{
+  "enabled": true,
+  "name": "ZEC Micro Test",
+  "pair": "ZECUSDT",
+  "description": "Tiny gaps (0.25-0.9%) just to verify the bot trades. Net ~0.05% per cycle after 0.20% round-trip fees.",
+
+  "ladder_config": {
+    "base_gap": 0.003,
+    "gap_max": 0.05,
+    "ladders": 4,
+    "fibonacci": [1, 1, 2, 3],
+    "unit_size_zec": 0.06
+  },
+
+  "capital_allocation": {
+    "max_allocation_percent": 0.10,
+    "reserve_percent": 0.10
+  },
+
+  "risk_management": {
+    "safety_multiplier": 1.0,
+    "stop_loss_percent": -0.20,
+    "take_profit_percent": 0.05
+  },
+
+  "execution": {
+    "auto_rebalance": true,
+    "rebalance_interval_hours": 24,
+    "min_profit_to_close": 0.0025
+  },
+
+  "order_placement": {
+    "mode": "distribution",
+    "child_order_usdt": 20.0,
+    "proximity_percent": 0.004,
+    "max_open_orders_cap": 20,
+    "min_children_per_ladder": 1,
+    "max_children_per_ladder": 1,
+    "spread_mode": "geometric",
+    "child_profit_percent": 0.0025,
+    "child_sell_mode": "child_only"
+  },
+
+  "recovery": {
+    "enabled": false
+  }
+}
