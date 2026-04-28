@@ -188,7 +188,7 @@ class StateStore:
         for order_id, od in om.active_orders.items():
             child = od.get("child")
             ladder = od.get("ladder") or {}
-            active_orders[str(order_id)] = {
+            entry = {
                 "strategy": od["strategy"],
                 "level": od["level"],
                 "type": od["type"],
@@ -198,16 +198,35 @@ class StateStore:
                 # without needing the ladder to maintain a children list.
                 "child": self._serialize_child(child) if child is not None else None,
             }
+            # Recovery-merged SELLs reference a list of pooled children rather
+            # than a single child. Persist it so the lot can be reconstructed.
+            if od.get("type") == "SELL_MERGED":
+                entry["recovery_children"] = [
+                    self._serialize_child(c) for c in (od.get("recovery_children") or [])
+                ]
+            active_orders[str(order_id)] = entry
 
         # _pending_children: drop parent_ladder ref (re-link on load via parent_level)
         pending = {}
         for name, queue in om._pending_children.items():
             pending[name] = [self._serialize_child(c) for c in queue]
 
+        # _recovery_lots: drop parent_ladder ref (re-link on load via parent_level)
+        recovery_lots = {}
+        for name, lot in getattr(om, "_recovery_lots", {}).items():
+            recovery_lots[name] = {
+                "children": [self._serialize_child(c) for c in lot.get("children", [])],
+                "merged_sell_order_id": lot.get("merged_sell_order_id"),
+                "merged_sell_price": lot.get("merged_sell_price"),
+                "merged_sell_qty": lot.get("merged_sell_qty"),
+            }
+
         return {
             "active_orders": active_orders,
             "sequential_state": dict(om._sequential_state),
             "pending_children": pending,
+            "recovery_lots": recovery_lots,
+            "last_stale_check": dict(getattr(om, "_last_stale_check", {})),
         }
 
     # ---- apply --------------------------------------------------------------
@@ -278,6 +297,26 @@ class StateStore:
                 order_id = int(order_id_str)
             except (TypeError, ValueError):
                 order_id = order_id_str
+
+            otype = od.get("type")
+            # SELL_MERGED has no single ladder; restore from embedded child snapshots.
+            if otype == "SELL_MERGED":
+                rebuilt_children = []
+                for c in od.get("recovery_children", []) or []:
+                    cd = dict(c)
+                    parent = ladder_index.get((od["strategy"], cd.get("parent_level")))
+                    if parent is not None:
+                        cd["parent_ladder"] = parent
+                    rebuilt_children.append(cd)
+                om.active_orders[order_id] = {
+                    "strategy": od["strategy"],
+                    "level": od.get("level", "recovery"),
+                    "type": otype,
+                    "order": od["order"],
+                    "recovery_children": rebuilt_children,
+                }
+                continue
+
             ladder = ladder_index.get((od["strategy"], od.get("ladder_level")))
             if ladder is None:
                 logger.warning(f"Saved order {order_id} references unknown ladder "
@@ -291,7 +330,7 @@ class StateStore:
             om.active_orders[order_id] = {
                 "strategy": od["strategy"],
                 "level": od["level"],
-                "type": od["type"],
+                "type": otype,
                 "order": od["order"],
                 "ladder": ladder,
                 "child": child,
@@ -315,3 +354,22 @@ class StateStore:
                 cd["parent_ladder"] = parent
                 rebuilt.append(cd)
             om._pending_children[name] = rebuilt
+
+        # Recovery lots — same re-link pattern. Missing on older state files;
+        # default to empty so resume still works for pre-recovery sessions.
+        om._recovery_lots = {}
+        for name, lot in (data.get("recovery_lots", {}) or {}).items():
+            rebuilt_children = []
+            for c in lot.get("children", []) or []:
+                cd = dict(c)
+                parent = ladder_index.get((name, cd.get("parent_level")))
+                if parent is not None:
+                    cd["parent_ladder"] = parent
+                rebuilt_children.append(cd)
+            om._recovery_lots[name] = {
+                "children": rebuilt_children,
+                "merged_sell_order_id": lot.get("merged_sell_order_id"),
+                "merged_sell_price": lot.get("merged_sell_price"),
+                "merged_sell_qty": lot.get("merged_sell_qty"),
+            }
+        om._last_stale_check = dict(data.get("last_stale_check", {}) or {})
