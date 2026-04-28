@@ -161,6 +161,46 @@ class Strategy:
         """Check whether this strategy uses distribution order placement."""
         return self.config.get('order_placement', {}).get('mode') == 'distribution'
 
+    def get_recovery_config(self):
+        """Return recovery-mode config with defaults applied.
+
+        Recovery mode coexists with normal child SELLs:
+          - Normal flow: small lots sell at child_profit_percent (e.g. 1.2%)
+            for steady profits in sideway markets.
+          - Recovery flow: when a child fills with the price already well
+            below it (drawdown_threshold), or an existing SELL has drifted
+            far above the market (stale_sell_threshold), the position is
+            pulled into a per-strategy "recovery lot". Once min_merge_count
+            children are pooled, they are sold together as one merged SELL
+            at avg_cost * (1 + profit_target). This lets the bot wait for a
+            small bounce on the aggregate cost basis instead of trying to
+            fill each tiny SELL at its individual deep-water target.
+
+        Keys:
+          - enabled: master switch (default False — opt-in per strategy)
+          - drawdown_threshold: at-fill trigger. If
+            (child_buy - current_price) / child_buy >= this, the child
+            joins the recovery lot instead of getting a normal SELL.
+          - stale_sell_threshold: ongoing trigger for already-placed SELLs.
+            If (sell_price - current_price) / current_price >= this, the
+            SELL is cancelled and its position joins the recovery lot.
+          - stale_check_interval_seconds: minimum gap between stale scans.
+          - profit_target: merged-lot exit margin over avg cost basis.
+          - min_merge_count: only place a merged SELL once this many
+            children are pooled. With a single recovery child we still
+            place its individual SELL — but at the recovery profit_target,
+            not the larger child_profit_percent.
+        """
+        recovery = self.config.get('recovery', {}) or {}
+        return {
+            'enabled': bool(recovery.get('enabled', False)),
+            'drawdown_threshold': float(recovery.get('drawdown_threshold', 0.03)),
+            'stale_sell_threshold': float(recovery.get('stale_sell_threshold', 0.05)),
+            'stale_check_interval_seconds': int(recovery.get('stale_check_interval_seconds', 300)),
+            'profit_target': float(recovery.get('profit_target', 0.005)),
+            'min_merge_count': max(1, int(recovery.get('min_merge_count', 2))),
+        }
+
     def calculate_child_orders(self, ladder, next_ladder_buy_price=None):
         """Split a ladder into N child orders.
 

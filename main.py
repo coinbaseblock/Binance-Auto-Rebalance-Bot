@@ -280,6 +280,13 @@ def run_live_trading(args):
                 # Check filled orders
                 filled = order_manager.check_filled_orders()
 
+                # Refresh prices first so any recovery-routed SELLs use a live
+                # market price for their drawdown decision.
+                current_prices = {}
+                for strategy in strategies:
+                    symbol = strategy.config['pair']
+                    current_prices[symbol] = client.get_current_price(symbol)
+
                 if filled:
                     state_dirty = True
                     logger.info(f"Processed {len(filled)} filled orders")
@@ -292,18 +299,14 @@ def run_live_trading(args):
                                 if strategy.config['name'] == order_data['strategy']:
                                     child = order_data.get('child')
                                     if child is not None:
+                                        cp = current_prices.get(strategy.config['pair'])
                                         order_manager._place_child_sell(
                                             strategy, child, order_data['ladder'],
-                                            order_data.get('filled_qty', child['qty'])
+                                            order_data.get('filled_qty', child['qty']),
+                                            current_price=cp,
                                         )
                                     else:
                                         order_manager.place_sell_order(strategy, order_data['ladder'])
-
-                # Update portfolio statistics
-                current_prices = {}
-                for strategy in strategies:
-                    symbol = strategy.config['pair']
-                    current_prices[symbol] = client.get_current_price(symbol)
 
                 stats = portfolio.get_statistics(current_prices)
 
@@ -321,7 +324,12 @@ def run_live_trading(args):
                         order_manager.place_distribution_orders(strategy, cp)
                     elif order_manager.is_sequential_mode(strategy):
                         order_manager.place_next_sequential_order(strategy, cp)
-                    if len(order_manager.active_orders) != open_before:
+                    # Recovery scan: roll any far-from-market SELLs into the
+                    # merged recovery lot so they don't sit unfillable, and
+                    # ensure a merged SELL exists whenever the lot has
+                    # pooled children. Throttled internally.
+                    rolled = order_manager.check_stale_sells(strategy, cp)
+                    if rolled or len(order_manager.active_orders) != open_before:
                         state_dirty = True
 
                 # Auto-restart: when all positions are closed and no active orders for a strategy

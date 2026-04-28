@@ -19,6 +19,19 @@ class OrderManager:
         # {strategy_name: list[child_dict]} — children are promoted once price is close
         # enough and there is an open-order slot available.
         self._pending_children = {}
+        # Recovery mode: per-strategy pool of underwater children waiting to be
+        # sold together as one merged SELL once price bounces above their
+        # combined cost basis. See Strategy.get_recovery_config() for details.
+        # {strategy_name: {
+        #     'children': [child_dict, ...],     # serialized snapshots; parent_ladder linked
+        #     'merged_sell_order_id': int|None,  # currently active merged SELL on Binance
+        #     'merged_sell_price': float|None,   # last placed price
+        #     'merged_sell_qty': float|None,     # last placed total quantity
+        # }}
+        self._recovery_lots = {}
+        # Throttle for stale-SELL scans so we don't hammer the exchange.
+        # {strategy_name: last_check_unix_ts}
+        self._last_stale_check = {}
 
     def place_ladder_buy_orders(self, strategy, current_price):
         """Place buy orders for all pending ladders, respecting balance and exchange filters"""
@@ -267,6 +280,11 @@ class OrderManager:
         """Clear pending child queue (e.g. on cycle restart)."""
         self._pending_children.pop(strategy_name, None)
         self._insufficient_balance_warned.pop(strategy_name, None)
+        # Recovery state belongs to the cycle too — once the cycle ends, any
+        # surviving recovery lot has either filled (handled via the normal
+        # SELL_MERGED path) or the user issued a full reset.
+        self._recovery_lots.pop(strategy_name, None)
+        self._last_stale_check.pop(strategy_name, None)
 
     def log_planned_distribution(self, strategy):
         """Log planned children per ladder for visibility."""
@@ -429,14 +447,35 @@ class OrderManager:
                         f"L{child['parent_level']}.{child['idx']}: {e}")
             return None
 
-    def _place_child_sell(self, strategy, child, parent_ladder, filled_qty):
-        """Place child SELL at the child's own sell_price.
+    def _place_child_sell(self, strategy, child, parent_ladder, filled_qty,
+                          current_price=None):
+        """Place a SELL for a freshly-filled child.
 
-        The child's sell_price is computed by Strategy.calculate_child_orders()
-        according to the configured child_sell_mode (default: min of the
-        per-child take-profit and the parent ladder's planned exit). Falls
-        back to the parent ladder's sell_price for legacy state files where
-        the child dict was created before per-child sells existed.
+        Two paths:
+          1. Recovery path — when recovery is enabled and the price is already
+             well below the child's buy price (drawdown_threshold breached),
+             the child is pooled into a per-strategy recovery lot. Once
+             min_merge_count children are pooled, they are sold together as
+             one merged SELL targeting avg_cost * (1 + recovery_profit).
+          2. Normal path (legacy) — the child gets its own SELL at its
+             precomputed sell_price (child_profit_percent over its buy).
+
+        Both paths can run for different children at the same time, which is
+        the point: small lots near the market continue to trade actively
+        while underwater lots wait pooled for a bounce.
+        """
+        rec_cfg = strategy.get_recovery_config()
+        if rec_cfg['enabled'] and current_price is not None and self._eligible_for_recovery(
+                child, current_price, rec_cfg):
+            return self._add_to_recovery(strategy, child, parent_ladder, filled_qty,
+                                         current_price, rec_cfg)
+        return self._place_normal_child_sell(strategy, child, parent_ladder, filled_qty)
+
+    def _place_normal_child_sell(self, strategy, child, parent_ladder, filled_qty):
+        """Place a single child SELL at its precomputed sell_price.
+
+        Falls back to the parent ladder's sell_price for legacy state files
+        where the child dict was created before per-child sells existed.
         """
         strategy_name = strategy.config['name']
         symbol = strategy.config['pair']
@@ -464,6 +503,402 @@ class OrderManager:
             logger.error(f"[{strategy_name}] Failed to place child SELL "
                         f"L{child['parent_level']}.{child['idx']}: {e}")
             return None
+
+    # ---- Recovery mode -----------------------------------------------------
+
+    @staticmethod
+    def _eligible_for_recovery(child, current_price, rec_cfg):
+        """Check whether a freshly-filled child is underwater enough to merge.
+
+        Drawdown is measured against the child's own buy price (the market
+        moved past the limit before the limit could fill its individual SELL
+        target).
+        """
+        buy = child.get('buy_price') or 0
+        if buy <= 0 or current_price <= 0:
+            return False
+        drawdown = (buy - current_price) / buy
+        return drawdown >= rec_cfg['drawdown_threshold']
+
+    def _get_recovery_lot(self, strategy_name):
+        """Return the recovery lot dict for a strategy, creating it if absent."""
+        lot = self._recovery_lots.get(strategy_name)
+        if lot is None:
+            lot = {
+                'children': [],
+                'merged_sell_order_id': None,
+                'merged_sell_price': None,
+                'merged_sell_qty': None,
+            }
+            self._recovery_lots[strategy_name] = lot
+        return lot
+
+    def _add_to_recovery(self, strategy, child, parent_ladder, filled_qty,
+                         current_price, rec_cfg):
+        """Add a filled child to the recovery lot and (re)place merged SELL.
+
+        Stamps the child with the actual filled quantity so the merged SELL
+        adds up to what the bot really owns from this fill.
+        """
+        strategy_name = strategy.config['name']
+        # Snapshot fields we need for resale; copy so later strategy edits
+        # don't mutate our pooled record.
+        snapshot = {
+            'idx': child.get('idx'),
+            'parent_level': child.get('parent_level'),
+            'buy_price': child.get('buy_price'),
+            'qty': float(filled_qty),
+            'usdt_cost': float(filled_qty) * float(child.get('buy_price') or 0),
+            'parent_ladder': parent_ladder,
+        }
+        lot = self._get_recovery_lot(strategy_name)
+        lot['children'].append(snapshot)
+        # Mark the live child so it doesn't get a normal SELL on a retry path.
+        child['status'] = 'recovery'
+        logger.info(f"[{strategy_name}] Recovery: pooled L{snapshot['parent_level']}."
+                    f"{snapshot['idx']} qty={snapshot['qty']:.6f} @ buy ${snapshot['buy_price']:.4f} "
+                    f"(price ${current_price:.4f}, lot size {len(lot['children'])})")
+        self._refresh_merged_sell(strategy, lot, rec_cfg)
+        return None  # No single order to return — merged SELL reflects the lot.
+
+    def _compute_merged_target(self, lot, rec_cfg):
+        """Return (total_qty, target_price) for the current recovery lot.
+
+        Target = total_cost / total_qty * (1 + profit_target). With one child
+        this is just child.buy_price * (1 + profit_target); the merging is
+        what gives this any real edge over a per-child SELL.
+        """
+        total_qty = sum(c['qty'] for c in lot['children'])
+        if total_qty <= 0:
+            return 0.0, 0.0
+        total_cost = sum(c['usdt_cost'] for c in lot['children'])
+        avg_cost = total_cost / total_qty
+        target = avg_cost * (1.0 + rec_cfg['profit_target'])
+        return total_qty, target
+
+    def _cancel_merged_sell(self, strategy, lot):
+        """Cancel the currently active merged SELL (if any).
+
+        Returns 'filled' if Binance reported the order already filled (the
+        caller should let check_filled_orders process it on the next loop),
+        'partial' if it is partially filled (we leave it alone; recomputing
+        on a partial fill would require splitting children proportionally),
+        'cancelled' if successfully cancelled, or 'absent' if there was no
+        live merged SELL.
+        """
+        order_id = lot.get('merged_sell_order_id')
+        if order_id is None:
+            return 'absent'
+        symbol = strategy.config['pair']
+        try:
+            status = self.client.client.get_order(symbol=symbol, orderId=order_id)
+        except Exception as e:
+            logger.warning(f"[{strategy.config['name']}] Recovery: cannot query merged SELL "
+                          f"{order_id}: {e}; not replacing")
+            return 'unknown'
+        s = status.get('status')
+        if s == 'FILLED':
+            logger.info(f"[{strategy.config['name']}] Recovery: merged SELL {order_id} "
+                       f"already filled; deferring to check_filled_orders")
+            return 'filled'
+        if s == 'PARTIALLY_FILLED':
+            logger.warning(f"[{strategy.config['name']}] Recovery: merged SELL {order_id} "
+                          f"is partially filled; not replacing until it resolves")
+            return 'partial'
+        if s in ('NEW', 'PENDING_CANCEL'):
+            try:
+                self.client.cancel_order(symbol=symbol, order_id=order_id)
+            except Exception as e:
+                logger.warning(f"[{strategy.config['name']}] Recovery: cancel failed for "
+                              f"merged SELL {order_id}: {e}")
+                return 'unknown'
+            self.active_orders.pop(order_id, None)
+            lot['merged_sell_order_id'] = None
+            lot['merged_sell_price'] = None
+            lot['merged_sell_qty'] = None
+            return 'cancelled'
+        # Anything else (CANCELED, EXPIRED, REJECTED): treat as gone.
+        self.active_orders.pop(order_id, None)
+        lot['merged_sell_order_id'] = None
+        lot['merged_sell_price'] = None
+        lot['merged_sell_qty'] = None
+        return 'cancelled'
+
+    def _refresh_merged_sell(self, strategy, lot, rec_cfg):
+        """Cancel any existing merged SELL and replace it with one sized to
+        the current pool. If the existing SELL is partially filled we abort —
+        the partial fill will resolve through the normal check loop and we'll
+        rebuild on the next add or stale scan.
+        """
+        strategy_name = strategy.config['name']
+        symbol = strategy.config['pair']
+
+        # Don't bother placing a merged SELL until at least min_merge_count
+        # children have pooled. Below that, place an individual SELL at the
+        # recovery target so the lot still earns a small bounce profit.
+        if len(lot['children']) < rec_cfg['min_merge_count']:
+            return self._refresh_individual_recovery_sell(strategy, lot, rec_cfg)
+
+        cancel_status = self._cancel_merged_sell(strategy, lot)
+        if cancel_status in ('partial', 'filled', 'unknown'):
+            return None
+
+        # Also clear any individual recovery SELLs (placed when the lot only
+        # had one child) — they're being superseded by the merged SELL.
+        self._cancel_individual_recovery_sells(strategy, lot)
+
+        total_qty, target_price = self._compute_merged_target(lot, rec_cfg)
+        if total_qty <= 0 or target_price <= 0:
+            return None
+
+        ok, reason = self.client.check_percent_price_filter(symbol, 'SELL', target_price)
+        if not ok:
+            logger.warning(f"[{strategy_name}] Recovery: merged SELL @ ${target_price:.4f} "
+                          f"rejected by price filter: {reason}; will retry on next add")
+            return None
+
+        try:
+            order = self.client.create_limit_order(
+                symbol=symbol, side='SELL', quantity=total_qty, price=target_price
+            )
+        except Exception as e:
+            logger.error(f"[{strategy_name}] Recovery: merged SELL placement failed: {e}")
+            return None
+
+        self.active_orders[order['orderId']] = {
+            'strategy': strategy_name,
+            'level': 'recovery',
+            'type': 'SELL_MERGED',
+            'order': order,
+            'recovery_children': list(lot['children']),
+        }
+        lot['merged_sell_order_id'] = order['orderId']
+        lot['merged_sell_price'] = float(target_price)
+        lot['merged_sell_qty'] = float(total_qty)
+        logger.info(f"[{strategy_name}] Recovery: merged SELL placed for "
+                   f"{len(lot['children'])} children, qty={total_qty:.6f} @ ${target_price:.4f} "
+                   f"(profit target {rec_cfg['profit_target']:.2%} over avg cost)")
+        return order
+
+    def _refresh_individual_recovery_sell(self, strategy, lot, rec_cfg):
+        """Place individual SELL(s) for recovery children when below the merge
+        threshold. Each child gets its own SELL at child.buy * (1 + target),
+        registered like a normal child SELL but flagged as recovery so the
+        stale-scan can roll it into a merged lot once more children join.
+        """
+        strategy_name = strategy.config['name']
+        symbol = strategy.config['pair']
+        existing_ids = {
+            oid for oid, od in self.active_orders.items()
+            if od.get('type') == 'SELL_RECOVERY' and od.get('strategy') == strategy_name
+        }
+        # Track which lot children already have an order so we don't double-place.
+        covered_keys = set()
+        for oid in existing_ids:
+            ch = self.active_orders[oid].get('child') or {}
+            covered_keys.add((ch.get('parent_level'), ch.get('idx')))
+
+        for snap in lot['children']:
+            key = (snap['parent_level'], snap['idx'])
+            if key in covered_keys:
+                continue
+            target = float(snap['buy_price']) * (1.0 + rec_cfg['profit_target'])
+            ok, reason = self.client.check_percent_price_filter(symbol, 'SELL', target)
+            if not ok:
+                logger.warning(f"[{strategy_name}] Recovery (single): SELL @ ${target:.4f} "
+                              f"rejected by price filter: {reason}")
+                continue
+            try:
+                order = self.client.create_limit_order(
+                    symbol=symbol, side='SELL', quantity=snap['qty'], price=target
+                )
+            except Exception as e:
+                logger.error(f"[{strategy_name}] Recovery (single): SELL placement failed: {e}")
+                continue
+            self.active_orders[order['orderId']] = {
+                'strategy': strategy_name,
+                'level': snap['parent_level'],
+                'type': 'SELL_RECOVERY',
+                'order': order,
+                'ladder': snap['parent_ladder'],
+                'child': {
+                    'idx': snap['idx'],
+                    'parent_level': snap['parent_level'],
+                    'buy_price': snap['buy_price'],
+                    'qty': snap['qty'],
+                    'sell_price': target,
+                },
+            }
+            logger.info(f"[{strategy_name}] Recovery (single): SELL placed L{snap['parent_level']}."
+                       f"{snap['idx']} @ ${target:.4f} ({rec_cfg['profit_target']:.2%} over buy)")
+        return None
+
+    def _cancel_individual_recovery_sells(self, strategy, lot):
+        """Cancel any per-child recovery SELLs for children now in the merged lot."""
+        strategy_name = strategy.config['name']
+        symbol = strategy.config['pair']
+        lot_keys = {(c['parent_level'], c['idx']) for c in lot['children']}
+        for oid, od in list(self.active_orders.items()):
+            if od.get('type') != 'SELL_RECOVERY' or od.get('strategy') != strategy_name:
+                continue
+            ch = od.get('child') or {}
+            if (ch.get('parent_level'), ch.get('idx')) not in lot_keys:
+                continue
+            try:
+                self.client.cancel_order(symbol=symbol, order_id=oid)
+            except Exception as e:
+                logger.warning(f"[{strategy_name}] Recovery: failed to cancel individual SELL "
+                              f"{oid}: {e}")
+                continue
+            self.active_orders.pop(oid, None)
+
+    def check_stale_sells(self, strategy, current_price):
+        """Periodically scan open SELLs whose limit price has drifted far
+        above the market and roll them into the recovery lot.
+
+        This is the second recovery trigger (the first being at-fill drawdown
+        in _place_child_sell). It catches the case where a child filled in
+        sideways conditions, got a normal +profit SELL, and then the market
+        dropped well below it — leaving an unfillable SELL parked on the
+        book. Cancelling it and re-pooling the position lets us settle for a
+        smaller bounce on a combined cost basis.
+
+        Throttled by stale_check_interval_seconds.
+        """
+        rec_cfg = strategy.get_recovery_config()
+        if not rec_cfg['enabled']:
+            return 0
+        strategy_name = strategy.config['name']
+        now = time.time()
+        last = self._last_stale_check.get(strategy_name, 0)
+        if now - last < rec_cfg['stale_check_interval_seconds']:
+            return 0
+        self._last_stale_check[strategy_name] = now
+
+        threshold = rec_cfg['stale_sell_threshold']
+        if threshold <= 0 or current_price <= 0:
+            return 0
+
+        lot = self._get_recovery_lot(strategy_name)
+        rolled = 0
+        symbol = strategy.config['pair']
+
+        for oid, od in list(self.active_orders.items()):
+            if od.get('strategy') != strategy_name:
+                continue
+            otype = od.get('type')
+            # Only normal child SELLs and individual recovery SELLs are
+            # candidates. SELL_MERGED is itself the recovery exit, so leave
+            # it alone.
+            if otype not in ('SELL', 'SELL_RECOVERY'):
+                continue
+            order_obj = od.get('order') or {}
+            try:
+                sell_price = float(order_obj.get('price') or 0)
+            except (TypeError, ValueError):
+                continue
+            if sell_price <= 0:
+                continue
+            distance = (sell_price - current_price) / current_price
+            if distance < threshold:
+                continue
+
+            child = od.get('child') or {}
+            qty_str = order_obj.get('origQty') or order_obj.get('executedQty') or child.get('qty')
+            try:
+                qty = float(qty_str) if qty_str is not None else float(child.get('qty', 0))
+            except (TypeError, ValueError):
+                qty = float(child.get('qty', 0))
+            if qty <= 0:
+                continue
+
+            try:
+                self.client.cancel_order(symbol=symbol, order_id=oid)
+            except Exception as e:
+                logger.warning(f"[{strategy_name}] Recovery: cancel of stale SELL {oid} failed: {e}")
+                continue
+            self.active_orders.pop(oid, None)
+
+            buy_price = float(child.get('buy_price') or 0)
+            if buy_price <= 0:
+                # Fallback: derive a buy price from the SELL using the original
+                # child profit so the recovery cost basis is at least sensible.
+                placement = strategy.config.get('order_placement', {})
+                cp_pct = float(placement.get('child_profit_percent', 0.012) or 0.012)
+                buy_price = sell_price / (1.0 + cp_pct)
+
+            snapshot = {
+                'idx': child.get('idx'),
+                'parent_level': child.get('parent_level', od.get('level')),
+                'buy_price': buy_price,
+                'qty': qty,
+                'usdt_cost': qty * buy_price,
+                'parent_ladder': od.get('ladder'),
+            }
+            lot['children'].append(snapshot)
+            rolled += 1
+            logger.info(f"[{strategy_name}] Recovery: stale SELL {oid} L{snapshot['parent_level']}"
+                       f".{snapshot['idx']} @ ${sell_price:.4f} cancelled "
+                       f"(price ${current_price:.4f}, distance {distance:.2%}); pooled into recovery")
+
+        # Also re-place a merged SELL for any recovery lot that has children
+        # but no live order (e.g. it got cancelled on the exchange, or we
+        # restarted with a populated lot but the order is gone). Otherwise
+        # the lot would sit there waiting forever.
+        live_merged_id = lot.get('merged_sell_order_id')
+        merged_alive = live_merged_id is not None and live_merged_id in self.active_orders
+        if rolled > 0 or (lot['children'] and not merged_alive):
+            self._refresh_merged_sell(strategy, lot, rec_cfg)
+        return rolled
+
+    def _drop_from_recovery_lot(self, strategy_name, parent_level, idx):
+        """Remove a child from the per-strategy recovery lot once its
+        individual recovery SELL has filled."""
+        lot = self._recovery_lots.get(strategy_name)
+        if not lot:
+            return
+        lot['children'] = [
+            c for c in lot['children']
+            if not (c.get('parent_level') == parent_level and c.get('idx') == idx)
+        ]
+        if not lot['children']:
+            self._recovery_lots.pop(strategy_name, None)
+
+    def _handle_merged_sell_fill(self, order_data, status):
+        """Distribute a merged-SELL fill across all participating children.
+
+        Each child's portfolio position is closed at the merged sell price,
+        weighted by the child's own quantity. The parent-ladder children_closed
+        counters are bumped, and once a ladder has all its children closed the
+        ladder itself is marked closed (matching the per-child SELL flow).
+        """
+        strategy_name = order_data['strategy']
+        children = order_data.get('recovery_children') or []
+        sell_price = float(status.get('price') or 0)
+        executed_qty = float(status.get('executedQty') or 0)
+        total_pool = sum(float(c.get('qty', 0)) for c in children)
+        # Defensive: scale child qty to actual fill if Binance rounded.
+        scale = (executed_qty / total_pool) if total_pool > 0 else 1.0
+        for snap in children:
+            qty = float(snap.get('qty', 0)) * scale
+            if qty <= 0:
+                continue
+            level_tuple = (snap.get('parent_level'), snap.get('idx'))
+            self.portfolio.close_position(
+                strategy_name=strategy_name,
+                ladder_level=level_tuple,
+                sell_price=sell_price,
+                quantity=qty,
+            )
+            parent = snap.get('parent_ladder') or {}
+            parent['children_closed'] = parent.get('children_closed', 0) + 1
+            if parent.get('children_total', 0) > 0 \
+                    and parent['children_closed'] >= parent['children_total']:
+                parent['status'] = 'closed'
+        logger.info(f"[{strategy_name}] Recovery: merged SELL filled @ ${sell_price:.4f}, "
+                   f"{len(children)} children closed (qty {executed_qty:.6f})")
+        # Recovery cycle complete — clear pool so the next drawdown starts fresh.
+        self._recovery_lots.pop(strategy_name, None)
 
     def log_planned_ladders(self, strategy):
         """Log all planned ladder levels with prices so user knows what will be placed."""
@@ -526,15 +961,19 @@ class OrderManager:
                     order_data['filled_qty'] = float(status['executedQty'])
                     filled_orders.append(order_data)
 
+                    otype = order_data['type']
                     child = order_data.get('child')
                     # Distribution children use a composite level for portfolio
                     # bookkeeping so multiple children per ladder don't collide.
-                    position_level = (
-                        (order_data['level'], child['idx']) if child
-                        else order_data['level']
-                    )
+                    if otype == 'SELL_MERGED':
+                        position_level = None  # handled by _handle_merged_sell_fill
+                    else:
+                        position_level = (
+                            (order_data['level'], child['idx']) if child
+                            else order_data['level']
+                        )
 
-                    if order_data['type'] == 'BUY':
+                    if otype == 'BUY':
                         self.portfolio.add_position(
                             strategy_name=order_data['strategy'],
                             ladder_level=position_level,
@@ -550,7 +989,11 @@ class OrderManager:
                         else:
                             logger.info(f"Buy order filled: Level {order_data['level']}")
 
-                    elif order_data['type'] == 'SELL':
+                    elif otype == 'SELL_MERGED':
+                        # Recovery exit — fan out the fill to every pooled child.
+                        self._handle_merged_sell_fill(order_data, status)
+
+                    elif otype in ('SELL', 'SELL_RECOVERY'):
                         self.portfolio.close_position(
                             strategy_name=order_data['strategy'],
                             ladder_level=position_level,
@@ -560,15 +1003,23 @@ class OrderManager:
 
                         if child is not None:
                             child['status'] = 'closed'
-                            parent = order_data['ladder']
+                            parent = order_data.get('ladder') or {}
                             parent['children_closed'] = parent.get('children_closed', 0) + 1
                             # Mark the whole ladder closed only when every child
                             # has completed its cycle.
-                            if parent['children_closed'] >= parent.get('children_total', 0) \
-                                    and parent.get('children_total', 0) > 0:
+                            if parent.get('children_total', 0) > 0 \
+                                    and parent['children_closed'] >= parent['children_total']:
                                 parent['status'] = 'closed'
-                            logger.info(f"Child SELL filled: "
+                            tag = "Child SELL" if otype == 'SELL' else "Recovery SELL"
+                            logger.info(f"{tag} filled: "
                                        f"L{order_data['level']}.{child['idx']}")
+                            if otype == 'SELL_RECOVERY':
+                                # Drop from per-strategy recovery lot too.
+                                self._drop_from_recovery_lot(
+                                    order_data['strategy'],
+                                    child.get('parent_level'),
+                                    child.get('idx'),
+                                )
                         else:
                             order_data['ladder']['status'] = 'closed'
                             logger.info(f"Sell order filled: Level {order_data['level']}")

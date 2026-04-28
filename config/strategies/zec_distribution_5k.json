@@ -39,5 +39,14 @@
     "spread_mode": "geometric",
     "child_profit_percent": 0.012,
     "child_sell_mode": "min_of_both"
+  },
+
+  "recovery": {
+    "enabled": true,
+    "drawdown_threshold": 0.03,
+    "stale_sell_threshold": 0.05,
+    "stale_check_interval_seconds": 300,
+    "profit_target": 0.005,
+    "min_merge_count": 2
   }
 }
