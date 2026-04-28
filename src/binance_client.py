@@ -14,6 +14,10 @@ logger = logging.getLogger(__name__)
 
 
 class BinanceClient:
+    # Beyond this age, cached prices are too stale to use even as a network-error
+    # fallback. The caller will receive an exception instead.
+    MAX_CACHE_FALLBACK_AGE_SEC = 600
+
     def __init__(self, testnet=False):
         load_dotenv()
 
@@ -26,6 +30,7 @@ class BinanceClient:
         self.client = Client(api_key, api_secret, testnet=testnet)
         self.testnet = testnet
         self._symbol_filters = {}  # Cache for symbol filter info
+        self._price_cache = {}  # symbol -> (price, fetch_timestamp)
 
         logger.info(f"Binance client initialized (testnet={testnet})")
 
@@ -116,11 +121,21 @@ class BinanceClient:
         return True, ""
 
     def get_current_price(self, symbol, retries=3, backoff=2):
-        """Get current market price for a symbol, with retry on network errors"""
+        """Get current market price for a symbol, with retry on network errors.
+
+        On success the price is cached together with a fetch timestamp. If all
+        retries fail with network errors and a recent enough cached price exists
+        (age <= MAX_CACHE_FALLBACK_AGE_SEC), the cached price is returned as a
+        soft fallback so the caller can keep operating. Use get_price_age() to
+        detect when a returned price is stale and gate trading decisions
+        accordingly.
+        """
         for attempt in range(retries + 1):
             try:
                 ticker = self.client.get_symbol_ticker(symbol=symbol)
-                return float(ticker['price'])
+                price = float(ticker['price'])
+                self._price_cache[symbol] = (price, time.time())
+                return price
             except BinanceAPIException as e:
                 logger.error(f"Error getting price for {symbol}: {e}")
                 raise
@@ -133,8 +148,27 @@ class BinanceClient:
                                    f"(attempt {attempt + 1}/{retries + 1}), retrying in {wait}s: {e}")
                     time.sleep(wait)
                 else:
+                    cached = self._price_cache.get(symbol)
+                    if cached is not None:
+                        cached_price, cached_ts = cached
+                        age = time.time() - cached_ts
+                        if age <= self.MAX_CACHE_FALLBACK_AGE_SEC:
+                            logger.warning(
+                                f"Network error getting price for {symbol} after "
+                                f"{retries + 1} attempts; using cached price "
+                                f"${cached_price} (age {age:.0f}s): {e}"
+                            )
+                            return cached_price
                     logger.error(f"Network error getting price for {symbol} after {retries + 1} attempts: {e}")
                     raise
+
+    def get_price_age(self, symbol):
+        """Return age in seconds of the last cached price for symbol, or None
+        if no successful fetch has been recorded yet."""
+        cached = self._price_cache.get(symbol)
+        if cached is None:
+            return None
+        return time.time() - cached[1]
 
     def get_account_balance(self, asset='USDT'):
         """Get account balance for specific asset"""

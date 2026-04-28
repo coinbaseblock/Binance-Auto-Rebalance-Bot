@@ -218,6 +218,10 @@ def run_live_trading(args):
     logger.info("Starting trading loop...")
     check_interval = 30  # Check more frequently for sequential mode responsiveness
     max_network_backoff = 300  # Cap backoff at 5 minutes
+    # If get_current_price falls back to cache during a network outage and the
+    # cached value is older than this, skip placing new orders this iteration to
+    # avoid trading on a ghost price.
+    stale_price_threshold = 60
     consecutive_errors = 0
     current_prices = {}
 
@@ -281,17 +285,35 @@ def run_live_trading(args):
                 filled = order_manager.check_filled_orders()
 
                 # Refresh prices first so any recovery-routed SELLs use a live
-                # market price for their drawdown decision.
+                # market price for their drawdown decision. get_current_price
+                # falls back to a cached value during a network outage; the age
+                # check below decides whether the cached value is fresh enough
+                # to base trading decisions on.
                 current_prices = {}
+                max_price_age = 0.0
                 for strategy in strategies:
                     symbol = strategy.config['pair']
                     current_prices[symbol] = client.get_current_price(symbol)
+                    age = client.get_price_age(symbol)
+                    if age is not None and age > max_price_age:
+                        max_price_age = age
+
+                prices_stale = max_price_age > stale_price_threshold
+                if prices_stale:
+                    logger.warning(
+                        f"Prices stale ({max_price_age:.0f}s > {stale_price_threshold}s "
+                        f"threshold) — skipping new order placement this iteration"
+                    )
 
                 if filled:
                     state_dirty = True
                     logger.info(f"Processed {len(filled)} filled orders")
 
-                    # Place corresponding sell orders for filled buys
+                    # Place corresponding sell orders for filled buys. When
+                    # prices are stale we pass current_price=None so the
+                    # recovery-eligibility check is skipped (it would otherwise
+                    # use a ghost price for drawdown comparison); the SELL
+                    # itself uses the child's precomputed sell_price.
                     for order_data in filled:
                         if order_data['type'] == 'BUY':
                             # Find the strategy
@@ -299,7 +321,8 @@ def run_live_trading(args):
                                 if strategy.config['name'] == order_data['strategy']:
                                     child = order_data.get('child')
                                     if child is not None:
-                                        cp = current_prices.get(strategy.config['pair'])
+                                        cp = (None if prices_stale
+                                              else current_prices.get(strategy.config['pair']))
                                         order_manager._place_child_sell(
                                             strategy, child, order_data['ladder'],
                                             order_data.get('filled_qty', child['qty']),
@@ -316,45 +339,46 @@ def run_live_trading(args):
                                f"Open: {stats['num_open_positions']} | "
                                f"Trades: {stats['num_trades']}")
 
-                # Sequential mode: check if price is approaching next levels
-                for strategy in strategies:
-                    cp = current_prices[strategy.config['pair']]
-                    open_before = len(order_manager.active_orders)
-                    if order_manager.is_distribution_mode(strategy):
-                        order_manager.place_distribution_orders(strategy, cp)
-                    elif order_manager.is_sequential_mode(strategy):
-                        order_manager.place_next_sequential_order(strategy, cp)
-                    # Recovery scan: roll any far-from-market SELLs into the
-                    # merged recovery lot so they don't sit unfillable, and
-                    # ensure a merged SELL exists whenever the lot has
-                    # pooled children. Throttled internally.
-                    rolled = order_manager.check_stale_sells(strategy, cp)
-                    if rolled or len(order_manager.active_orders) != open_before:
-                        state_dirty = True
-
-                # Auto-restart: when all positions are closed and no active orders for a strategy
-                for strategy in strategies:
-                    strategy_has_orders = any(
-                        od['strategy'] == strategy.config['name']
-                        for od in order_manager.active_orders.values()
-                    )
-                    if not strategy_has_orders and strategy.all_ladders_closed():
-                        current_price = current_prices[strategy.config['pair']]
-                        logger.info(f"=== AUTO-RESTART: {strategy.config['name']} cycle complete, "
-                                    f"starting new cycle at ${current_price:.2f} ===")
-                        strategy.reset_ladders()
-                        strategy.update_prices(current_price)
-                        order_manager.log_planned_ladders(strategy)
+                if not prices_stale:
+                    # Sequential mode: check if price is approaching next levels
+                    for strategy in strategies:
+                        cp = current_prices[strategy.config['pair']]
+                        open_before = len(order_manager.active_orders)
                         if order_manager.is_distribution_mode(strategy):
-                            order_manager.reset_distribution_state(strategy.config['name'])
-                            order_manager.log_planned_distribution(strategy)
-                            order_manager.place_distribution_orders(strategy, current_price)
+                            order_manager.place_distribution_orders(strategy, cp)
                         elif order_manager.is_sequential_mode(strategy):
-                            order_manager.reset_sequential_state(strategy.config['name'])
-                            order_manager.place_next_sequential_order(strategy, current_price)
-                        else:
-                            order_manager.place_ladder_buy_orders(strategy, current_price)
-                        state_dirty = True
+                            order_manager.place_next_sequential_order(strategy, cp)
+                        # Recovery scan: roll any far-from-market SELLs into the
+                        # merged recovery lot so they don't sit unfillable, and
+                        # ensure a merged SELL exists whenever the lot has
+                        # pooled children. Throttled internally.
+                        rolled = order_manager.check_stale_sells(strategy, cp)
+                        if rolled or len(order_manager.active_orders) != open_before:
+                            state_dirty = True
+
+                    # Auto-restart: when all positions are closed and no active orders for a strategy
+                    for strategy in strategies:
+                        strategy_has_orders = any(
+                            od['strategy'] == strategy.config['name']
+                            for od in order_manager.active_orders.values()
+                        )
+                        if not strategy_has_orders and strategy.all_ladders_closed():
+                            current_price = current_prices[strategy.config['pair']]
+                            logger.info(f"=== AUTO-RESTART: {strategy.config['name']} cycle complete, "
+                                        f"starting new cycle at ${current_price:.2f} ===")
+                            strategy.reset_ladders()
+                            strategy.update_prices(current_price)
+                            order_manager.log_planned_ladders(strategy)
+                            if order_manager.is_distribution_mode(strategy):
+                                order_manager.reset_distribution_state(strategy.config['name'])
+                                order_manager.log_planned_distribution(strategy)
+                                order_manager.place_distribution_orders(strategy, current_price)
+                            elif order_manager.is_sequential_mode(strategy):
+                                order_manager.reset_sequential_state(strategy.config['name'])
+                                order_manager.place_next_sequential_order(strategy, current_price)
+                            else:
+                                order_manager.place_ladder_buy_orders(strategy, current_price)
+                            state_dirty = True
 
                 # Persist on any state change OR at least once per heartbeat
                 # interval, so an unexpected shutdown (power loss, force-kill)
