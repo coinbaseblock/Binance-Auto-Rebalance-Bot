@@ -155,6 +155,10 @@ class Strategy:
             'spread_mode': placement.get('spread_mode', 'geometric'),
             'child_profit_percent': placement.get('child_profit_percent', 0.012),
             'child_sell_mode': placement.get('child_sell_mode', 'min_of_both'),
+            # Multiplier applied to the symbol's MIN_NOTIONAL when sizing
+            # children, so the rounded order still clears the filter after
+            # qty/price step-rounding. 1.10 = 10% margin.
+            'notional_safety_buffer': placement.get('notional_safety_buffer', 1.10),
         }
 
     def is_distribution_mode(self):
@@ -201,7 +205,8 @@ class Strategy:
             'min_merge_count': max(1, int(recovery.get('min_merge_count', 2))),
         }
 
-    def calculate_child_orders(self, ladder, next_ladder_buy_price=None):
+    def calculate_child_orders(self, ladder, next_ladder_buy_price=None,
+                               min_notional=0.0):
         """Split a ladder into N child orders.
 
         Three knobs control the shape (see get_distribution_config):
@@ -223,6 +228,11 @@ class Strategy:
             ladder: dict with buy_price, sell_price, usdt_cost, level, gap_percent
             next_ladder_buy_price: buy_price of the ladder one level deeper, or
                 None if this is the deepest ladder.
+            min_notional: symbol's MIN_NOTIONAL filter value. When > 0, the
+                child count is reduced so even the smallest Fibonacci-weighted
+                child clears min_notional × notional_safety_buffer. Without
+                this clamp, fib weights like 1/33 produce sub-$5 top children
+                that Binance rejects with "Filter failure: NOTIONAL".
 
         Returns:
             list of child dicts: {idx, parent_level, buy_price, sell_price,
@@ -235,6 +245,9 @@ class Strategy:
         spread_mode = cfg['spread_mode']
         child_profit = max(0.0, float(cfg['child_profit_percent']))
         child_sell_mode = cfg['child_sell_mode']
+        notional_floor = max(0.0, float(min_notional)) * float(
+            cfg.get('notional_safety_buffer', 1.10)
+        )
 
         top_price = ladder['buy_price']
         total_usdt = ladder['usdt_cost']
@@ -279,6 +292,23 @@ class Strategy:
         # Need at least 2 to actually spread; fall back to 1 for tiny ladders
         if total_usdt < target_size * 1.5:
             n = 1
+
+        # Reduce n so the smallest Fibonacci-weighted child still clears the
+        # exchange's MIN_NOTIONAL filter. With weights [1, 1, 2, 3, 5, 8, 13]
+        # at n=7 the top child is only 1/33 of total_usdt — for a $167 ladder
+        # that's ~$5.06, which after qty step-rounding falls below Binance's
+        # ~$5 min_notional and gets rejected. We trade fewer-but-valid children
+        # for guaranteed placements rather than smaller-and-rejected ones.
+        if notional_floor > 0 and n > 1:
+            while n > 1:
+                fib_n = _generate_fibonacci(n)
+                smallest_child_usdt = total_usdt * (fib_n[0] / sum(fib_n))
+                if smallest_child_usdt >= notional_floor:
+                    break
+                n -= 1
+            # If even n=1 is below floor, the parent ladder itself is too
+            # small for this symbol — keep n=1 and let the placement layer
+            # surface the filter error with full context.
 
         if n == 1:
             return [{
@@ -337,12 +367,17 @@ class Strategy:
 
         return children
 
-    def calculate_all_child_orders(self):
-        """Return {ladder_level: [children]} for every ladder (distribution mode)."""
+    def calculate_all_child_orders(self, min_notional=0.0):
+        """Return {ladder_level: [children]} for every ladder (distribution mode).
+
+        See calculate_child_orders for min_notional semantics.
+        """
         result = {}
         for i, ladder in enumerate(self.ladders):
             next_buy = self.ladders[i + 1]['buy_price'] if i + 1 < len(self.ladders) else None
-            result[ladder['level']] = self.calculate_child_orders(ladder, next_buy)
+            result[ladder['level']] = self.calculate_child_orders(
+                ladder, next_buy, min_notional=min_notional
+            )
         return result
 
     def to_dict(self):

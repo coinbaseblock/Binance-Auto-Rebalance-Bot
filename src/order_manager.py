@@ -286,11 +286,26 @@ class OrderManager:
         self._recovery_lots.pop(strategy_name, None)
         self._last_stale_check.pop(strategy_name, None)
 
+    def _get_symbol_min_notional(self, symbol):
+        """Fetch the symbol's MIN_NOTIONAL filter value (cached by client).
+
+        Returns 0.0 on any failure so callers fall back to no floor (the
+        exchange will still reject; the placement-time safety check
+        (_child_meets_notional) is the second line of defence).
+        """
+        try:
+            filters = self.client.get_symbol_filters(symbol)
+            return float(filters.get('min_notional', 0) or 0)
+        except Exception as e:
+            logger.warning(f"Could not fetch min_notional for {symbol}: {e}")
+            return 0.0
+
     def log_planned_distribution(self, strategy):
         """Log planned children per ladder for visibility."""
         if not self.is_distribution_mode(strategy):
             return
-        all_children = strategy.calculate_all_child_orders()
+        min_notional = self._get_symbol_min_notional(strategy.config['pair'])
+        all_children = strategy.calculate_all_child_orders(min_notional=min_notional)
         strategy_name = strategy.config['name']
         total_children = sum(len(cs) for cs in all_children.values())
         logger.info(f"[{strategy_name}] Distribution plan: {total_children} child orders "
@@ -316,8 +331,9 @@ class OrderManager:
         if strategy_name in self._pending_children:
             return
 
+        min_notional = self._get_symbol_min_notional(strategy.config['pair'])
         queue = []
-        all_children = strategy.calculate_all_child_orders()
+        all_children = strategy.calculate_all_child_orders(min_notional=min_notional)
         for ladder in strategy.get_pending_ladders():
             ladder_children = all_children.get(ladder['level'], [])
             ladder['children_total'] = len(ladder_children)
@@ -380,6 +396,16 @@ class OrderManager:
                 # lower ones definitely aren't either.
                 break
 
+            # Placement-time NOTIONAL guard: if the rounded order is below the
+            # symbol's min_notional, drop the child instead of letting Binance
+            # reject it on every loop iteration forever. The strategy-side
+            # n-cap should prevent this, but we keep the guard for resumed
+            # state files predating the fix and for edge-cases like extreme
+            # price moves between planning and placement.
+            if not self._child_meets_notional(strategy, child):
+                queue.remove(child)
+                continue
+
             order = self._place_child_buy(strategy, child)
             if order is not None:
                 queue.remove(child)
@@ -387,6 +413,39 @@ class OrderManager:
                 symbol_open_orders += 1
 
         return placed
+
+    def _child_meets_notional(self, strategy, child):
+        """Return True if the child's rounded notional clears MIN_NOTIONAL.
+
+        Logs a clear warning and returns False otherwise so the caller can
+        drop the child from the pending queue. Falls back to True (let the
+        exchange decide) when filter info isn't available.
+        """
+        symbol = strategy.config['pair']
+        try:
+            filters = self.client.get_symbol_filters(symbol)
+        except Exception:
+            return True
+        min_notional = float(filters.get('min_notional', 0) or 0)
+        if min_notional <= 0:
+            return True
+        try:
+            rp = float(self.client.round_price(symbol, child['buy_price']))
+            rq = float(self.client.round_quantity(symbol, child['qty']))
+        except Exception:
+            return True
+        rounded_notional = rp * rq
+        if rounded_notional < min_notional:
+            logger.warning(
+                f"[{strategy.config['name']}] Dropping child "
+                f"L{child['parent_level']}.{child['idx']}: rounded notional "
+                f"${rounded_notional:.2f} below min_notional ${min_notional:.2f} "
+                f"(planned ${child.get('usdt_cost', 0):.2f} @ ${child['buy_price']:.4f}). "
+                f"Increase child_order_usdt or lower min_children_per_ladder so "
+                f"per-child size clears the exchange filter."
+            )
+            return False
+        return True
 
     def _place_child_buy(self, strategy, child):
         """Place a single child BUY order on Binance."""
