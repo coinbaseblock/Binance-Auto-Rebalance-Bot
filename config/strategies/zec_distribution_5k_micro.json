@@ -1,0 +1,52 @@
+{
+  "enabled": true,
+  "name": "ZEC Distribution 5K + Micro",
+  "pair": "ZECUSDT",
+  "description": "Hybrid: keeps the 8-ladder structure of zec_distribution_5k (base_gap 4%, fib up to 21, gap_max 60%, unit_size 0.5 ZEC) so deep swings still trigger the same big buys, but borrows the 'always-trading' feel of zec_micro_test by using smaller children ($12), tighter take-profit (0.5%), eager proximity (0.6%), and a higher child cap so the topmost ladder splits into many small orders that fill on tiny bounces.",
+
+  "ladder_config": {
+    "base_gap": 0.04,
+    "gap_max": 0.60,
+    "ladders": 8,
+    "fibonacci": [1, 1, 2, 3, 5, 8, 13, 21],
+    "unit_size_zec": 0.5
+  },
+
+  "capital_allocation": {
+    "max_allocation_percent": 1.0,
+    "reserve_percent": 0.10
+  },
+
+  "risk_management": {
+    "safety_multiplier": 1.5,
+    "stop_loss_percent": -0.50,
+    "take_profit_percent": 0.25
+  },
+
+  "execution": {
+    "auto_rebalance": true,
+    "rebalance_interval_hours": 12,
+    "min_profit_to_close": 0.003
+  },
+
+  "order_placement": {
+    "mode": "distribution",
+    "child_order_usdt": 12.0,
+    "proximity_percent": 0.006,
+    "max_open_orders_cap": 220,
+    "min_children_per_ladder": 2,
+    "max_children_per_ladder": 16,
+    "spread_mode": "geometric",
+    "child_profit_percent": 0.005,
+    "child_sell_mode": "min_of_both"
+  },
+
+  "recovery": {
+    "enabled": true,
+    "drawdown_threshold": 0.03,
+    "stale_sell_threshold": 0.05,
+    "stale_check_interval_seconds": 300,
+    "profit_target": 0.005,
+    "min_merge_count": 2
+  }
+}
