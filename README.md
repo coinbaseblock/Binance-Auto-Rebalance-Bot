@@ -469,9 +469,13 @@ bash scripts/build-binaries.sh linux/arm64 windows/amd64
 
 ### Run the binary
 
-The binary is self-contained (Python interpreter + all deps embedded). It
-still needs the **`config/`** directory and a **`.env`** file in the working
-directory, plus writable `logs/` and `data/` folders. The simplest layout:
+The binary is **fully self-contained** — Python interpreter, every Python
+dependency (Flask, flask-socketio, eventlet, ccxt, pandas, …), **and the
+web dashboard's HTML template** are all embedded in the executable. So
+`--mode dashboard` works straight out of the binary with zero extra files.
+You still need the **`config/`** directory and a **`.env`** file in the
+working directory, plus writable `logs/` and `data/` folders. The simplest
+layout:
 
 ```
 my-bot/
@@ -490,10 +494,11 @@ my-bot/
 # One-time: make it executable
 chmod +x ./binance-bot-linux-amd64
 
-# Web dashboard (real data)
+# Web dashboard (real data — needs API keys in .env)
 ./binance-bot-linux-amd64 --mode dashboard --port 5000
+# → open http://localhost:5000
 
-# Web dashboard (demo data, no API keys needed)
+# Web dashboard (demo data — no API keys needed, great for UI preview)
 ./binance-bot-linux-amd64 --mode dashboard --port 5000 --demo
 
 # Paper-trade on Binance testnet
@@ -502,6 +507,9 @@ chmod +x ./binance-bot-linux-amd64
 # Live-trade (REAL money)
 ./binance-bot-linux-amd64 --mode live --strategies dcr_balanced zec_balanced
 
+# Live-trade with the new SELL-side accumulation preset
+./binance-bot-linux-amd64 --mode live --strategies zec_distribution_5k_micro --reset-state
+
 # Backtest the last 30 days
 ./binance-bot-linux-amd64 --mode backtest --strategies btc_conservative --days 30
 
@@ -509,6 +517,10 @@ chmod +x ./binance-bot-linux-amd64
 ./binance-bot-linux-amd64 --mode backtest --strategies all \
     --start 2024-01-01 --end 2024-06-30
 ```
+
+> The dashboard binds to `0.0.0.0` by default — accessible from other
+> machines on the same network. Use SSH port-forwarding (`ssh -L 5000:localhost:5000 host`)
+> or a firewall rule if you want it private.
 
 ARM64 (Raspberry Pi, AWS Graviton, etc.) — same commands, just swap the
 binary name:
@@ -521,14 +533,20 @@ chmod +x ./binance-bot-linux-arm64
 #### Windows
 
 ```cmd
-:: Web dashboard
+:: Web dashboard (real data) — open http://localhost:5000 after launch
 binance-bot-windows-amd64.exe --mode dashboard --port 5000
+
+:: Web dashboard (demo data — no API keys required)
+binance-bot-windows-amd64.exe --mode dashboard --port 5000 --demo
 
 :: Paper trading
 binance-bot-windows-amd64.exe --mode paper --strategies btc_conservative
 
 :: Live trading
 binance-bot-windows-amd64.exe --mode live --strategies dcr_balanced
+
+:: Live trading with the new SELL-side accumulation preset
+binance-bot-windows-amd64.exe --mode live --strategies zec_distribution_5k_micro --reset-state
 
 :: Backtest last 30 days
 binance-bot-windows-amd64.exe --mode backtest --strategies btc_conservative --days 30
@@ -582,11 +600,18 @@ binary + `config/` + `.env`.
   Linux). If it fails on your network, you can build natively on a Windows
   host with `pip install pyinstaller && pyinstaller --onefile main.py`.
 - Each binary is large (~80–150 MB) because it bundles `numpy`, `pandas`,
-  `matplotlib`, `eventlet`, and `ccxt`. This is expected for PyInstaller
-  one-file builds.
+  `matplotlib`, `eventlet`, `flask`, `flask-socketio`, and `ccxt`. This is
+  expected for PyInstaller one-file builds.
 - The binary reads `config/strategies/*.json` from the **current working
   directory**, not from a path baked into the executable — so you can
   swap presets without rebuilding.
+- **Dashboard templates are bundled inside the binary** via
+  `--add-data "src/templates;src/templates"`. `--mode dashboard` works
+  with no extra files — the embedded `dashboard.html` is extracted to a
+  temp dir at startup and served by Flask. If you build PyInstaller
+  manually instead of using the supplied Dockerfiles, you must include
+  the same `--add-data` flag or the dashboard will return
+  `TemplateNotFound: dashboard.html`.
 
 ## Configuration
 
@@ -652,23 +677,33 @@ trading loop uses (Portfolio, OrderManager, BinanceClient).
 
 ### Launch
 
+You can run the dashboard from any of the four supported install paths —
+the HTML, JS, and assets it serves are identical:
+
 ```bash
-# Real data — needs API keys in .env (testnet or mainnet)
+# 1) Python source — needs API keys in .env (testnet or mainnet)
 python main.py --mode dashboard --port 5000
 
-# Demo mode — sample data, no API keys required (great for UI preview)
+# 2) Python source, demo mode — sample data, no API keys required
 python main.py --mode dashboard --port 5000 --demo
 
-# Standalone binary
-./binance-bot-linux-amd64 --mode dashboard --port 5000
-./binance-bot-linux-amd64 --mode dashboard --port 5000 --demo
+# 3) Standalone binary (Linux / macOS / Windows / Raspberry Pi)
+#    The HTML template is bundled inside the executable — nothing extra to copy.
+./binance-bot-linux-amd64           --mode dashboard --port 5000
+./binance-bot-linux-arm64           --mode dashboard --port 5000
+binance-bot-windows-amd64.exe       --mode dashboard --port 5000
+./binance-bot-linux-amd64           --mode dashboard --port 5000 --demo
 
-# Docker (Compose profile)
+# 4) Docker (Compose profile)
 docker compose --profile dashboard up -d   # real data
 docker compose --profile demo      up -d   # demo data
 ```
 
 Open **http://localhost:5000** in your browser.
+
+> The dashboard binds to `0.0.0.0` so it is reachable from other hosts on
+> the same LAN. Lock it down with a firewall rule or use SSH port-forwarding
+> (`ssh -L 5000:localhost:5000 user@host`) if you want it private.
 
 ### What the dashboard shows
 

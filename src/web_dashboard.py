@@ -2,6 +2,8 @@
 Realtime Web Dashboard - Flask + SocketIO for live trading display
 """
 import logging
+import os
+import sys
 import threading
 import time
 from datetime import datetime
@@ -11,13 +13,28 @@ from flask_socketio import SocketIO, emit
 logger = logging.getLogger(__name__)
 
 
+def _resolve_template_folder():
+    # In a PyInstaller onefile bundle, --add-data extracts src/templates to
+    # sys._MEIPASS/src/templates. Flask's relative template_folder is resolved
+    # against the module's __file__, which under PyInstaller can point inside
+    # the archive rather than the extracted data root, so the templates aren't
+    # found. Resolve to an absolute path explicitly when frozen.
+    if getattr(sys, 'frozen', False):
+        meipass = getattr(sys, '_MEIPASS', None)
+        if meipass:
+            bundled = os.path.join(meipass, 'src', 'templates')
+            if os.path.isdir(bundled):
+                return bundled
+    return 'templates'
+
+
 class TradingDashboard:
     """Realtime web dashboard for trading bot"""
 
     def __init__(self, host='0.0.0.0', port=5000):
         self.host = host
         self.port = port
-        self.app = Flask(__name__, template_folder='templates')
+        self.app = Flask(__name__, template_folder=_resolve_template_folder())
         self.app.config['SECRET_KEY'] = 'trading-bot-secret'
         self.socketio = SocketIO(self.app, cors_allowed_origins="*")
 
