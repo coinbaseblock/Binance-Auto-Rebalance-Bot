@@ -221,6 +221,25 @@ def run_live_trading(args):
         except Exception as e:
             logger.error(f"Failed to save initial state (continuing): {e}")
 
+    # Optional embedded dashboard: shares portfolio/order_manager/strategies/client
+    # with the trading loop so the UI reflects live state instead of a fresh empty
+    # session. Runs in a background thread (Flask/SocketIO).
+    dashboard = None
+    if getattr(args, 'with_dashboard', False):
+        dashboard = TradingDashboard(host='0.0.0.0', port=args.port)
+        dashboard.set_trading_components(portfolio, strategies, order_manager, client)
+        for strategy in strategies:
+            symbol = strategy.config['pair']
+            try:
+                dashboard.current_prices[symbol] = client.get_current_price(symbol)
+            except Exception as e:
+                logger.warning(f"Dashboard: could not seed price for {symbol}: {e}")
+        dashboard.start_async(debug=False)
+        print(f"\n{'='*60}")
+        print("DASHBOARD ENABLED")
+        print(f"Open http://localhost:{args.port} in your browser")
+        print(f"{'='*60}\n")
+
     # Main trading loop
     logger.info("Starting trading loop...")
     check_interval = 30  # Check more frequently for sequential mode responsiveness
@@ -306,6 +325,12 @@ def run_live_trading(args):
                         max_price_age = age
 
                 prices_stale = max_price_age > stale_price_threshold
+
+                # Mirror the loop's freshly fetched prices into the embedded
+                # dashboard so the UI doesn't have to re-hit the API itself.
+                if dashboard is not None:
+                    dashboard.current_prices.update(current_prices)
+
                 if prices_stale:
                     logger.warning(
                         f"Prices stale ({max_price_age:.0f}s > {stale_price_threshold}s "
@@ -608,6 +633,10 @@ def main():
                        help='Dashboard web server port (default: 5000)')
     parser.add_argument('--demo', action='store_true',
                        help='Run dashboard in demo mode with sample data')
+    parser.add_argument('--with-dashboard', action='store_true',
+                       help='When used with --mode live or --mode paper, also run the '
+                            'web dashboard in a background thread sharing the same '
+                            'portfolio/orders. Open http://localhost:<--port> to view.')
     parser.add_argument('--state-file',
                        help='Path to session state file (default: state/bot_state_<mode>.json). '
                             'Used by live and paper modes to persist trades, positions, and the '
