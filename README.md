@@ -4,14 +4,24 @@ Advanced multi-strategy cryptocurrency rebalancing bot using Fibonacci-Martingal
 
 ## Features
 
-- Multi-coin support (BTC, ETH, BNB, etc.)
+- Multi-coin support (BTC, ETH, BNB, DCR, ZEC, etc.)
 - Multi-strategy execution (Conservative, Balanced, Aggressive)
 - Fibonacci-based ladder spacing
 - Martingale position sizing
+- Distribution mode (split each ladder into Fibonacci-weighted child orders)
+- **Micro ladder tier** — flat-sized ladders at small gaps (0.4–1.6%) prepended
+  before the deep fibonacci tier so the bot trades actively in calm markets
+  while still covering big swings.
+- **SELL-side coin accumulation** — mirrored ladders above market that auto-pair
+  each SELL with a BUY-back at `sell_price / (1 + coin_profit_percent)`,
+  guaranteeing strictly more coins back than were sold each round-trip.
+- Crash-safe state persistence + auto-recovery (resume across restarts; reconcile
+  fills that landed while the bot was offline)
+- Real-time **web dashboard** (Flask + SocketIO) for monitoring, with optional
+  demo mode that runs without API keys.
 - Comprehensive backtesting
 - Fee calculation (0.1% Binance)
 - Stop-loss protection
-- Real-time portfolio tracking
 - Detailed logging
 
 ## Installation
@@ -633,6 +643,81 @@ python main.py --mode backtest --strategies btc_conservative --days 7 --interval
 Distribution-mode strategies auto-select `5m` candles so narrow child price
 bands resolve cleanly; pass `--interval 1h` to override.
 
+## Monitor Mode — Real-time Web Dashboard
+
+The bot ships with a Flask + SocketIO **web dashboard** that streams live
+portfolio, order, and price data to a browser. It is launched as its own
+process (`--mode dashboard`) and pulls data from the same components the
+trading loop uses (Portfolio, OrderManager, BinanceClient).
+
+### Launch
+
+```bash
+# Real data — needs API keys in .env (testnet or mainnet)
+python main.py --mode dashboard --port 5000
+
+# Demo mode — sample data, no API keys required (great for UI preview)
+python main.py --mode dashboard --port 5000 --demo
+
+# Standalone binary
+./binance-bot-linux-amd64 --mode dashboard --port 5000
+./binance-bot-linux-amd64 --mode dashboard --port 5000 --demo
+
+# Docker (Compose profile)
+docker compose --profile dashboard up -d   # real data
+docker compose --profile demo      up -d   # demo data
+```
+
+Open **http://localhost:5000** in your browser.
+
+### What the dashboard shows
+
+The page is a single Bootstrap-themed view that auto-refreshes via
+WebSocket (every ~5 s) — no manual reload needed.
+
+| Panel | Contents |
+|---|---|
+| **Top stat cards** | Portfolio Value, Total P&L (realized + unrealized), ROI %, Open Positions, Total Trades |
+| **Live Prices** | Current price ticker for every pair the loaded strategies trade |
+| **Capital Allocation** | Free vs. Allocated USDT, with a stacked progress bar |
+| **P&L History** chart | Rolling realized/unrealized P&L (last 50 ticks) |
+| **Equity Curve** chart | Total portfolio value over time |
+| **Active Orders** | Every live order on Binance — type (BUY / SELL / SELL_ACCUM / BUY_BACK), symbol, price, qty, ladder level |
+| **Recent Trades** | Last 10 round-trips — strategy, level, buy / sell price, realized profit |
+| **Active Strategies** | Each loaded preset with pair, ladder count, base gap |
+| **Activity Log** | Stream of order-placed / order-filled / trade events pushed over Socket.IO |
+
+### REST + Socket.IO API
+
+If you want to build your own UI or hook into Grafana/Prometheus, the
+dashboard exposes a small JSON API on the same port:
+
+| Endpoint | Returns |
+|---|---|
+| `GET /` | The HTML dashboard |
+| `GET /api/status` | Full status snapshot (portfolio, strategies, prices, active orders, recent trades) |
+| `GET /api/trades` | Full trades history |
+| `GET /api/positions` | All currently-open ladder positions |
+
+Socket.IO events broadcast to connected clients: `status_update` (every 5 s),
+`price_update`, `new_trade`, `order_placed`, `order_filled`.
+
+### Logs as a lightweight monitor
+
+If you don't need a UI, the trading loop logs every important event to
+`logs/bot.log` (path configurable via `LOG_FILE`). Tail it from any shell:
+
+```bash
+tail -f logs/bot.log
+
+# Docker
+docker compose logs -f binance-paper-zec
+```
+
+Each iteration logs portfolio value, ROI, open positions, active order count,
+new fills, and accumulation coin-gain stats — enough for an overview without
+the dashboard running.
+
 ## Distribution Order Mode
 
 `order_placement.mode = "distribution"` splits each ladder into several
@@ -697,6 +782,8 @@ Add an `order_placement` block to your strategy JSON:
 |---|---|---|---|
 | `config/strategies/btc_distribution_example.json` | BTCUSDT | flexible | Reference example for the docs above. |
 | `config/strategies/zec_distribution_5k.json` | ZECUSDT | ~5,000 USDT | 8 ladders, `child_order_usdt = 25`, cap 180. |
+| `config/strategies/zec_distribution_5k_micro.json` | ZECUSDT | ~5,000 USDT | Hybrid two-tier (4 micro + 8 fib) **plus** SELL-side coin accumulation — see the next section. |
+| `config/strategies/zec_micro_test.json` | ZECUSDT | small | Micro-only fee-beating verification preset. |
 
 Drop new presets into `config/strategies/` — every `*.json` in that folder is
 auto-discovered. The strategy *name* you pass to `--strategies` is the file
@@ -813,6 +900,122 @@ Key code anchors when you dig in:
 - `backtest/backtester.py:109` — distribution simulation branch.
 - `main.py:68-91, 143-147, 201-222` — CLI flags and live loop routing.
 - `tests/test_distribution.py` — 12 tests (10 strategy math, 2 backtest).
+
+## Micro Ladder Tier + SELL-side Coin Accumulation
+
+The default fibonacci ladder is great for big swings but its tightest BUY
+typically sits 4 %+ below market — so on a calm day the bot barely trades.
+And it only ever holds **USDT-side** profit; coins sold during a rally are
+gone. Two opt-in features fix both gaps without touching the deep fib tier.
+
+### 1. Micro ladder tier (BUY side)
+
+Prepends N flat-sized ladders at small gaps **before** the fibonacci tier.
+Each micro ladder has `tier: "micro"` and `units = 1`, so its size stays
+small (controlled by `unit_size_zec_micro`) regardless of position. The
+fibonacci tier is unchanged: martingale 2^i sizing anchored on the topmost
+fib ladder's buy price. Strategies without a `micro_layer` block behave
+exactly as before.
+
+```jsonc
+"ladder_config": {
+  "base_gap": 0.04, "gap_max": 0.60, "ladders": 8,
+  "fibonacci": [1, 1, 2, 3, 5, 8, 13, 21],
+  "unit_size_zec": 0.5,
+  "micro_layer": {
+    "enabled": true,
+    "count": 4,                  // 4 micro ladders prepended
+    "gap": 0.004,                // 0.4 % base spacing
+    "fibonacci": [1, 1, 2, 3],   // -0.4, -0.8, -1.6, -2.8 %
+    "unit_size_zec": 0.04        // flat size per micro ladder
+  }
+}
+```
+
+### 2. SELL-side coin accumulation (mirror above market)
+
+Mirrors the BUY structure above market for **coin** accumulation. Each SELL
+ladder is paired with an automatic **BUY-back** at
+`sell_price / (1 + coin_profit_percent)` — strictly more coins back than
+were sold each round-trip. The bot uses
+`min(structural_buyback_price, sell_price / (1 + coin_profit_percent))` so
+it can never accidentally lose coins.
+
+```jsonc
+"accumulation": {
+  "enabled": true,
+  "base_gap": 0.04, "gap_max": 0.60, "ladders": 8,
+  "fibonacci": [1, 1, 2, 3, 5, 8, 13, 21],
+  "unit_size_zec": 0.05,
+  "coin_profit_percent": 0.005,    // ~0.5 % coin gain per round-trip
+  "proximity_percent": 0.006,
+  "max_open_sells_cap": 30,
+  "reserve_coin_percent": 0.05,    // keep 5 % coin reserve for fees + rounding
+  "micro_layer": {
+    "enabled": true, "count": 4, "gap": 0.004,
+    "fibonacci": [1, 1, 2, 3], "unit_size_zec": 0.04
+  }
+}
+```
+
+### Order types you'll see in logs / dashboard
+
+| Type | Side | Pairing | Purpose |
+|---|---|---|---|
+| `BUY` | BUY | → `SELL` | USDT-side fib/micro entry |
+| `SELL` | SELL | follows a `BUY` fill | USDT-side exit (gain USDT) |
+| `SELL_ACCUM` | SELL | → `BUY_BACK` | Coin-side entry (mirrored above market) |
+| `BUY_BACK` | BUY | follows a `SELL_ACCUM` fill | Buys back **more** coins than were sold (gain coin) |
+
+### Profit guarantee per round-trip
+
+| Side | Round-trip | Gain |
+|---|---|---|
+| USDT-side | `BUY @ p` → `SELL @ p × (1 + child_profit_percent)` | +0.5 % USDT |
+| Coin-side | `SELL_ACCUM @ p` → `BUY_BACK @ p / (1 + coin_profit_percent)` | +0.5 % coin |
+
+Both sides run concurrently; the two queues are independent and persisted
+across restarts.
+
+### Pre-flight checklist (before live)
+
+1. **You must hold the coin in spot** equivalent to your USDT capital
+   (e.g. $5,000 capital on ZEC@$325 → ~15.4 ZEC). Insufficient balance
+   raises `RuntimeError` with a clear log line — the main loop catches it
+   without dying.
+2. `reserve_coin_percent` (default 0.05) keeps a safety buffer for Binance
+   fees and rounding.
+3. Run paper mode 1–2 hours first to verify micro orders promote near
+   market.
+4. `--reset-state` is required the first time you switch a strategy on
+   because the ladder schema now includes `sell_ladders` — old state files
+   don't have that field.
+
+### Run the included preset
+
+```bash
+# Paper trading (Binance testnet)
+python main.py --mode paper --strategies zec_distribution_5k_micro --reset-state
+
+# Live (real money)
+python main.py --mode live  --strategies zec_distribution_5k_micro --reset-state
+
+# Standalone binary
+binance-bot-windows-amd64.exe --mode paper --strategies zec_distribution_5k_micro --reset-state
+binance-bot-windows-amd64.exe --mode live  --strategies zec_distribution_5k_micro --reset-state
+```
+
+### Crash-safe state
+
+`SELL_ACCUM` / `BUY_BACK` orders, sell ladders, and per-strategy
+coin-gain stats are persisted to disk on every state change. If the bot
+crashes (or is killed) mid-cycle:
+
+- On restart, the saved active orders and ladders are reloaded from disk.
+- Any `SELL_ACCUM` that **filled while the bot was offline** is detected
+  via the existing reconcile-with-exchange path and triggers its
+  `BUY_BACK` on the next loop iteration.
+- USDT-side `BUY` / `SELL` recovery is unchanged.
 
 ## Strategy Examples
 
