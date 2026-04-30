@@ -184,6 +184,8 @@ def run_live_trading(args):
             order_manager.log_planned_ladders(strategy)
             if order_manager.is_distribution_mode(strategy):
                 order_manager.log_planned_distribution(strategy)
+            if order_manager.is_accumulation_enabled(strategy):
+                order_manager.log_planned_sell_ladders(strategy)
 
         # Persist marker state BEFORE placing any orders. If we crash between an
         # API call and recording the response, on next start `resuming` will be
@@ -207,6 +209,11 @@ def run_live_trading(args):
                 order_manager.place_next_sequential_order(strategy, current_price)
             else:
                 order_manager.place_ladder_buy_orders(strategy, current_price)
+
+            # SELL-side accumulation runs in parallel with whichever BUY mode
+            # is active. Place initial accumulation SELLs immediately.
+            if order_manager.is_accumulation_enabled(strategy):
+                order_manager.place_accumulation_orders(strategy, current_price)
 
         # Persist again now that orders have been placed
         try:
@@ -330,6 +337,17 @@ def run_live_trading(args):
                                         )
                                     else:
                                         order_manager.place_sell_order(strategy, order_data['ladder'])
+                        elif order_data['type'] == 'SELL_ACCUM' and order_data.get('needs_buyback'):
+                            # Accumulation SELL just filled: place the BUY_BACK.
+                            for strategy in strategies:
+                                if strategy.config['name'] == order_data['strategy']:
+                                    sell_ladder = order_data.get('sell_ladder') or {}
+                                    order_manager._place_buyback_buy(
+                                        strategy, sell_ladder,
+                                        filled_qty=sell_ladder.get('filled_qty', 0),
+                                        filled_sell_price=sell_ladder.get('filled_price', 0),
+                                    )
+                                    break
 
                 stats = portfolio.get_statistics(current_prices)
 
@@ -348,6 +366,16 @@ def run_live_trading(args):
                             order_manager.place_distribution_orders(strategy, cp)
                         elif order_manager.is_sequential_mode(strategy):
                             order_manager.place_next_sequential_order(strategy, cp)
+                        # Accumulation runs in parallel: promote pending SELL
+                        # ladders whose price is in proximity. Re-place any
+                        # buybacks that were deferred (e.g. price-filter retry).
+                        if order_manager.is_accumulation_enabled(strategy):
+                            try:
+                                order_manager.place_accumulation_orders(strategy, cp)
+                            except RuntimeError as e:
+                                # Insufficient coin balance: surfaced loudly,
+                                # don't kill the loop — let user fix wallet.
+                                logger.error(f"Accumulation halted: {e}")
                         # Recovery scan: roll any far-from-market SELLs into the
                         # merged recovery lot so they don't sit unfillable, and
                         # ensure a merged SELL exists whenever the lot has
@@ -362,11 +390,15 @@ def run_live_trading(args):
                             od['strategy'] == strategy.config['name']
                             for od in order_manager.active_orders.values()
                         )
-                        if not strategy_has_orders and strategy.all_ladders_closed():
+                        buy_done = strategy.all_ladders_closed()
+                        sell_done = (not strategy.is_accumulation_enabled()
+                                     or strategy.all_sell_ladders_closed())
+                        if not strategy_has_orders and buy_done and sell_done:
                             current_price = current_prices[strategy.config['pair']]
                             logger.info(f"=== AUTO-RESTART: {strategy.config['name']} cycle complete, "
                                         f"starting new cycle at ${current_price:.2f} ===")
                             strategy.reset_ladders()
+                            strategy.reset_sell_ladders()
                             strategy.update_prices(current_price)
                             order_manager.log_planned_ladders(strategy)
                             if order_manager.is_distribution_mode(strategy):
@@ -378,6 +410,12 @@ def run_live_trading(args):
                                 order_manager.place_next_sequential_order(strategy, current_price)
                             else:
                                 order_manager.place_ladder_buy_orders(strategy, current_price)
+                            if order_manager.is_accumulation_enabled(strategy):
+                                order_manager.log_planned_sell_ladders(strategy)
+                                try:
+                                    order_manager.place_accumulation_orders(strategy, current_price)
+                                except RuntimeError as e:
+                                    logger.error(f"Accumulation halt on restart: {e}")
                             state_dirty = True
 
                 # Persist on any state change OR at least once per heartbeat

@@ -161,6 +161,7 @@ class StateStore:
     def _serialize_strategy(self, strat):
         return {
             "ladders": [self._serialize_ladder(l) for l in strat.ladders],
+            "sell_ladders": [self._serialize_ladder(l) for l in getattr(strat, "sell_ladders", [])],
         }
 
     def _serialize_ladder(self, ladder):
@@ -204,6 +205,15 @@ class StateStore:
                 entry["recovery_children"] = [
                     self._serialize_child(c) for c in (od.get("recovery_children") or [])
                 ]
+            # Accumulation orders reference a sell_ladder (level above market)
+            # rather than a buy ladder. Persist enough to relink on restart.
+            if od.get("type") in ("SELL_ACCUM", "BUY_BACK"):
+                sell_ladder = od.get("sell_ladder") or {}
+                entry["sell_ladder_level"] = sell_ladder.get("level")
+                if od.get("type") == "BUY_BACK":
+                    entry["sold_qty"] = od.get("sold_qty")
+                    entry["sold_price"] = od.get("sold_price")
+                    entry["expected_buyback_qty"] = od.get("expected_buyback_qty")
             active_orders[str(order_id)] = entry
 
         # _pending_children: drop parent_ladder ref (re-link on load via parent_level)
@@ -227,6 +237,7 @@ class StateStore:
             "pending_children": pending,
             "recovery_lots": recovery_lots,
             "last_stale_check": dict(getattr(om, "_last_stale_check", {})),
+            "accumulation_stats": dict(getattr(om, "_accumulation_stats", {})),
         }
 
     # ---- apply --------------------------------------------------------------
@@ -261,23 +272,26 @@ class StateStore:
 
     def _apply_strategy(self, data, strat):
         saved = data.get("ladders") or []
-        if not saved:
-            return
-        # Build new ladders list, copying values verbatim. Children are
-        # attached and back-linked to their parent_ladder.
-        new_ladders = []
-        for l in saved:
-            ladder = dict(l)
-            children = ladder.pop("children", None)
-            if children is not None:
-                rebuilt = []
-                for c in children:
-                    cd = dict(c)
-                    cd["parent_ladder"] = ladder
-                    rebuilt.append(cd)
-                ladder["children"] = rebuilt
-            new_ladders.append(ladder)
-        strat.ladders = new_ladders
+        if saved:
+            # Build new ladders list, copying values verbatim. Children are
+            # attached and back-linked to their parent_ladder.
+            new_ladders = []
+            for l in saved:
+                ladder = dict(l)
+                children = ladder.pop("children", None)
+                if children is not None:
+                    rebuilt = []
+                    for c in children:
+                        cd = dict(c)
+                        cd["parent_ladder"] = ladder
+                        rebuilt.append(cd)
+                    ladder["children"] = rebuilt
+                new_ladders.append(ladder)
+            strat.ladders = new_ladders
+
+        saved_sell = data.get("sell_ladders") or []
+        if saved_sell:
+            strat.sell_ladders = [dict(l) for l in saved_sell]
 
     def _apply_order_manager(self, data, om, strategies_by_name):
         if not data:
@@ -285,9 +299,12 @@ class StateStore:
 
         # Build a ladder lookup per strategy: (strategy_name, level) -> ladder dict
         ladder_index = {}
+        sell_ladder_index = {}  # (strategy, +level) -> sell_ladder dict
         for name, strat in strategies_by_name.items():
             for ladder in strat.ladders:
                 ladder_index[(name, ladder["level"])] = ladder
+            for sl in getattr(strat, "sell_ladders", []) or []:
+                sell_ladder_index[(name, sl["level"])] = sl
 
         # Active orders: re-link ladder by (strategy, level); rebuild child dict
         # from embedded data and re-link its parent_ladder.
@@ -299,6 +316,27 @@ class StateStore:
                 order_id = order_id_str
 
             otype = od.get("type")
+            # Accumulation orders relink to a sell_ladder, not a buy ladder.
+            if otype in ("SELL_ACCUM", "BUY_BACK"):
+                sell_ladder = sell_ladder_index.get((od["strategy"], od.get("sell_ladder_level")))
+                if sell_ladder is None:
+                    logger.warning(f"Saved {otype} order {order_id} references unknown sell ladder "
+                                   f"+{od.get('sell_ladder_level')} on {od['strategy']}, dropping")
+                    continue
+                entry = {
+                    "strategy": od["strategy"],
+                    "level": od["level"],
+                    "type": otype,
+                    "order": od["order"],
+                    "sell_ladder": sell_ladder,
+                }
+                if otype == "BUY_BACK":
+                    entry["sold_qty"] = od.get("sold_qty")
+                    entry["sold_price"] = od.get("sold_price")
+                    entry["expected_buyback_qty"] = od.get("expected_buyback_qty")
+                om.active_orders[order_id] = entry
+                continue
+
             # SELL_MERGED has no single ladder; restore from embedded child snapshots.
             if otype == "SELL_MERGED":
                 rebuilt_children = []
@@ -373,3 +411,8 @@ class StateStore:
                 "merged_sell_qty": lot.get("merged_sell_qty"),
             }
         om._last_stale_check = dict(data.get("last_stale_check", {}) or {})
+        # Accumulation stats: cumulative coin gain across cycles. Default to
+        # empty for older state files predating SELL-side accumulation.
+        om._accumulation_stats = {
+            k: dict(v) for k, v in (data.get("accumulation_stats", {}) or {}).items()
+        }
