@@ -136,26 +136,70 @@ class TradingDashboard:
             except Exception as e:
                 logger.error(f"Error getting portfolio stats: {e}")
 
-        # Strategies info
+        # Strategies info. Configs use nested ladder_config.{ladders,base_gap},
+        # not flat num_ladders/base_gap_percent.
         for strategy in self.strategies:
             config = strategy.config
+            ladder_cfg = config.get('ladder_config', {}) or {}
+            micro_cfg = ladder_cfg.get('micro_layer', {}) or {}
+            num_ladders = int(ladder_cfg.get('ladders', 0) or 0)
+            if micro_cfg.get('enabled'):
+                num_ladders += int(micro_cfg.get('count', 0) or 0)
+            base_gap = float(ladder_cfg.get('base_gap', 0) or 0)
             data['strategies'].append({
                 'name': config.get('name', 'Unknown'),
                 'pair': config.get('pair', 'Unknown'),
-                'num_ladders': config.get('num_ladders', 0),
-                'base_gap_percent': config.get('base_gap_percent', 0)
+                'num_ladders': num_ladders,
+                'base_gap_percent': round(base_gap * 100, 2),
             })
 
-        # Active orders
+        # Active orders. The order_manager stores entries shaped like:
+        #   { 'strategy', 'level', 'type', 'order': <raw Binance response>,
+        #     'ladder': <dict>, 'child': <optional dict>, ... }
+        # The exchange-side fields (symbol/price/qty) live inside 'order', and
+        # 'ladder' is a dict — not a level number — so we must dig in to get
+        # the values the UI expects.
         if self.order_manager:
             for order_id, order_data in self.order_manager.active_orders.items():
+                raw = order_data.get('order') or {}
+                child = order_data.get('child') or {}
+                level = order_data.get('level')
+                # Distribution children carry an idx so the user can tell
+                # children of the same ladder apart (e.g. "-5.3").
+                if child and child.get('idx') is not None and level is not None:
+                    level_str = f"{level}.{child.get('idx')}"
+                else:
+                    level_str = str(level) if level is not None else ''
+
+                # Prefer numbers from the raw Binance response (authoritative).
+                try:
+                    price = float(raw.get('price', 0) or 0)
+                except (TypeError, ValueError):
+                    price = 0.0
+                try:
+                    quantity = float(raw.get('origQty', 0) or 0)
+                except (TypeError, ValueError):
+                    quantity = 0.0
+
+                # Normalize the order type for the UI's BUY/SELL badge. The
+                # internal vocabulary includes BUY_BACK, SELL_ACCUM, etc.
+                otype_raw = order_data.get('type', '') or ''
+                if 'BUY' in otype_raw.upper():
+                    otype_display = 'BUY'
+                elif 'SELL' in otype_raw.upper():
+                    otype_display = 'SELL'
+                else:
+                    otype_display = raw.get('side') or otype_raw or 'Unknown'
+
                 data['active_orders'].append({
                     'order_id': order_id,
-                    'type': order_data.get('type', 'Unknown'),
-                    'symbol': order_data.get('symbol', 'Unknown'),
-                    'price': order_data.get('price', 0),
-                    'quantity': order_data.get('quantity', 0),
-                    'level': order_data.get('ladder', 0)
+                    'type': otype_display,
+                    'subtype': otype_raw,
+                    'symbol': raw.get('symbol') or order_data.get('symbol') or 'Unknown',
+                    'price': price,
+                    'quantity': quantity,
+                    'level': level_str,
+                    'strategy': order_data.get('strategy', ''),
                 })
 
         # Recent trades (last 10)

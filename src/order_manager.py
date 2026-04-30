@@ -656,7 +656,7 @@ class OrderManager:
             return 'absent'
         symbol = strategy.config['pair']
         try:
-            status = self.client.client.get_order(symbol=symbol, orderId=order_id)
+            status = self.client.get_order(symbol=symbol, order_id=order_id)
         except Exception as e:
             logger.warning(f"[{strategy.config['name']}] Recovery: cannot query merged SELL "
                           f"{order_id}: {e}; not replacing")
@@ -1262,9 +1262,9 @@ class OrderManager:
         for order_id, order_data in list(self.active_orders.items()):
             try:
                 # Query order status
-                status = self.client.client.get_order(
+                status = self.client.get_order(
                     symbol=order_data['order']['symbol'],
-                    orderId=order_id
+                    order_id=order_id,
                 )
 
                 if status['status'] == 'FILLED':
@@ -1399,7 +1399,7 @@ class OrderManager:
         for order_id, od in list(self.active_orders.items()):
             symbol = od["order"].get("symbol")
             try:
-                status = self.client.client.get_order(symbol=symbol, orderId=order_id)
+                status = self.client.get_order(symbol=symbol, order_id=order_id)
             except Exception as e:
                 logger.warning(f"Reconcile: cannot query order {order_id} on {symbol}: {e}; "
                                f"keeping in active list")
