@@ -24,8 +24,10 @@ def _generate_fibonacci(n):
 class Strategy:
     def __init__(self, config_path):
         self.config = self._load_config(config_path)
-        self.ladders = []
+        self.ladders = []         # BUY ladders (below market)
+        self.sell_ladders = []    # SELL accumulation ladders (above market)
         self._calculate_ladders()
+        self._calculate_sell_ladders()
 
     def _load_config(self, config_path):
         """Load strategy configuration from JSON"""
@@ -35,59 +37,199 @@ class Strategy:
         return config
 
     def _calculate_ladders(self):
-        """Calculate ladder levels using compound multiplicative gaps.
+        """Calculate BUY ladder levels using compound multiplicative gaps.
 
-        Instead of additive gaps (which can exceed 100% and produce negative prices),
-        each level's gap is applied to the remaining price:
+        Two tiers of ladders, both below market:
+          - micro tier (optional, prepended): tight gaps + flat sizing for the
+            "always trading" feel — small lots that fill on minor dips.
+          - fibonacci tier: classic 2^i martingale with widening fib gaps for
+            big swings.
+
+        Each level's gap is applied to the remaining price:
             buy_multiplier = (1 - gap₁) × (1 - gap₂) × (1 - gap₃) × ...
 
         This guarantees buy_multiplier stays positive (never reaches zero).
+        The sell price for a level is the buy price of the level above it
+        (or starting price for the topmost ladder).
         """
         ladder_config = self.config['ladder_config']
+
+        self.ladders = []
+        buy_multiplier = 1.0
+        idx = 0
+
+        # ---- Micro tier (optional, prepended) ------------------------------
+        micro_cfg = ladder_config.get('micro_layer') or {}
+        if micro_cfg.get('enabled'):
+            micro_count = int(micro_cfg.get('count', 3))
+            micro_gap = float(micro_cfg.get('gap', 0.004))
+            micro_fib = micro_cfg.get('fibonacci') or [1] * micro_count
+            for i in range(micro_count):
+                fib = micro_fib[i] if i < len(micro_fib) else 1
+                gap = micro_gap * fib
+                prev_multiplier = buy_multiplier
+                buy_multiplier *= (1 - gap)
+                sell_multiplier = prev_multiplier if idx > 0 else 1.0
+                self.ladders.append({
+                    'level': -(idx + 1),
+                    'tier': 'micro',
+                    'fibonacci': fib,
+                    'raw_gap_percent': gap,
+                    'gap_percent': gap,
+                    'cumulative_gap_percent': 1 - buy_multiplier,
+                    'buy_price_multiplier': buy_multiplier,
+                    'sell_price_multiplier': sell_multiplier,
+                    'units': 1,  # micro ladders are flat-sized (no martingale)
+                    'status': 'pending',
+                })
+                idx += 1
+
+        # ---- Fibonacci tier -------------------------------------------------
         base_gap = ladder_config['base_gap']
         fibonacci = ladder_config['fibonacci']
         num_ladders = ladder_config['ladders']
-
-        buy_multiplier = 1.0
-        self.ladders = []
-
         gap_max = ladder_config.get('gap_max', 0.95)
 
         for i in range(num_ladders):
             fib = fibonacci[i]
             raw_gap = base_gap * fib
-            gap = min(raw_gap, gap_max)  # Clamp: never exceed gap_max (default 95%)
-
+            gap = min(raw_gap, gap_max)
             prev_multiplier = buy_multiplier
-            buy_multiplier *= (1 - gap)  # Compound: multiply remaining price
-
-            # Sell price multiplier is the previous level's buy multiplier
-            sell_multiplier = prev_multiplier if i > 0 else 1.0
-
-            ladder = {
-                'level': -(i + 1),
+            buy_multiplier *= (1 - gap)
+            sell_multiplier = prev_multiplier if idx > 0 else 1.0
+            self.ladders.append({
+                'level': -(idx + 1),
+                'tier': 'fib',
                 'fibonacci': fib,
                 'raw_gap_percent': raw_gap,
-                'gap_percent': gap,  # Effective gap after clamp
-                'cumulative_gap_percent': 1 - buy_multiplier,  # Total drop from starting price
+                'gap_percent': gap,
+                'cumulative_gap_percent': 1 - buy_multiplier,
                 'buy_price_multiplier': buy_multiplier,
                 'sell_price_multiplier': sell_multiplier,
-                'units': 2 ** i,  # Martingale: 1, 2, 4, 8, 16, 32...
-                'status': 'pending'
-            }
+                'units': 2 ** i,  # Martingale within the fib tier
+                'status': 'pending',
+            })
+            idx += 1
 
-            self.ladders.append(ladder)
+        if self.ladders:
+            logger.info(f"Calculated {len(self.ladders)} BUY ladders with total swing: "
+                        f"{self.ladders[-1]['cumulative_gap_percent']:.2%}")
+        else:
+            logger.info("No BUY ladders calculated")
 
-        logger.info(f"Calculated {len(self.ladders)} ladders with total swing: "
-                    f"{self.ladders[-1]['cumulative_gap_percent']:.2%}" if self.ladders else "No ladders calculated")
+    def _calculate_sell_ladders(self):
+        """Calculate SELL accumulation ladders above market price.
+
+        Mirror image of BUY ladders for coin accumulation:
+          - SELL above current price → fill on rallies, deliver USDT
+          - Auto-buyback at sell_price / (1 + coin_profit_percent) → buys
+            BACK MORE coins than sold, locking in coin gains.
+
+        Sell multiplier compounds upward:
+            sell_multiplier = (1 + gap₁) × (1 + gap₂) × ...
+
+        Buyback multiplier for each level is the previous level's sell
+        multiplier (or 1.0 for the topmost). On fill, we ALSO ensure the
+        actual buyback price never exceeds sell_price / (1 + coin_profit)
+        so a coin gain is guaranteed regardless of how the structure stacks.
+
+        No-op when accumulation is disabled.
+        """
+        accum = self.config.get('accumulation') or {}
+        self.sell_ladders = []
+        if not accum.get('enabled'):
+            return
+
+        sell_multiplier = 1.0
+        idx = 0
+
+        # ---- Micro tier (optional, prepended) ------------------------------
+        micro_cfg = accum.get('micro_layer') or {}
+        if micro_cfg.get('enabled'):
+            micro_count = int(micro_cfg.get('count', 3))
+            micro_gap = float(micro_cfg.get('gap', 0.004))
+            micro_fib = micro_cfg.get('fibonacci') or [1] * micro_count
+            for i in range(micro_count):
+                fib = micro_fib[i] if i < len(micro_fib) else 1
+                gap = micro_gap * fib
+                prev_multiplier = sell_multiplier
+                sell_multiplier *= (1 + gap)
+                buyback_multiplier = prev_multiplier if idx > 0 else 1.0
+                self.sell_ladders.append({
+                    'level': idx + 1,
+                    'tier': 'micro',
+                    'fibonacci': fib,
+                    'gap_percent': gap,
+                    'cumulative_gap_percent': sell_multiplier - 1,
+                    'sell_price_multiplier': sell_multiplier,
+                    'buyback_price_multiplier': buyback_multiplier,
+                    'units': 1,
+                    'status': 'pending',
+                })
+                idx += 1
+
+        # ---- Fibonacci tier -------------------------------------------------
+        base_gap = float(accum.get('base_gap', 0.04))
+        fibonacci = accum.get('fibonacci') or [1, 1, 2, 3, 5, 8, 13, 21]
+        num_ladders = int(accum.get('ladders', 8))
+        gap_max = float(accum.get('gap_max', 0.60))
+
+        for i in range(num_ladders):
+            fib = fibonacci[i] if i < len(fibonacci) else fibonacci[-1]
+            raw_gap = base_gap * fib
+            gap = min(raw_gap, gap_max)
+            prev_multiplier = sell_multiplier
+            sell_multiplier *= (1 + gap)
+            buyback_multiplier = prev_multiplier if idx > 0 else 1.0
+            self.sell_ladders.append({
+                'level': idx + 1,
+                'tier': 'fib',
+                'fibonacci': fib,
+                'raw_gap_percent': raw_gap,
+                'gap_percent': gap,
+                'cumulative_gap_percent': sell_multiplier - 1,
+                'sell_price_multiplier': sell_multiplier,
+                'buyback_price_multiplier': buyback_multiplier,
+                'units': 2 ** i,
+                'status': 'pending',
+            })
+            idx += 1
+
+        if self.sell_ladders:
+            logger.info(f"Calculated {len(self.sell_ladders)} SELL (accumulation) ladders "
+                        f"with total swing: +{self.sell_ladders[-1]['cumulative_gap_percent']:.2%}")
 
     def update_prices(self, current_price):
-        """Update ladder prices based on current market price"""
-        # Calculate base USDT per unit at level -1 for true Martingale
-        first_ladder_buy_price = current_price * self.ladders[0]['buy_price_multiplier']
+        """Update both BUY and SELL ladder prices from current market price."""
+        self._update_buy_ladder_prices(current_price)
+        self._update_sell_ladder_prices(current_price)
+
+    def _update_buy_ladder_prices(self, current_price):
+        """Update BUY ladder prices and quantities.
+
+        Sizing is tier-aware:
+          - micro tier: flat unit_size_zec_micro coins per ladder (taken from
+            ladder_config.micro_layer.unit_size_zec, falling back to the main
+            unit_size_zec scaled down). Keeps inner ladders affordable so
+            small dips trigger small buys.
+          - fib tier: martingale, units × base_usdt_per_unit, where
+            base_usdt_per_unit = top_fib_buy_price × unit_size_zec.
+        """
+        if not self.ladders:
+            return
+
+        ladder_config = self.config['ladder_config']
         unit_size_key = f"unit_size_{self.config['pair'][:3].lower()}"
-        unit_size = self.config['ladder_config'].get(unit_size_key, 0.01)
-        base_usdt_per_unit = first_ladder_buy_price * unit_size
+        unit_size = ladder_config.get(unit_size_key, 0.01)
+
+        micro_cfg = ladder_config.get('micro_layer') or {}
+        micro_unit = micro_cfg.get(unit_size_key, unit_size * 0.1) if micro_cfg.get('enabled') else 0
+
+        # Find the topmost fib ladder so its buy price anchors the
+        # martingale base (matches legacy behavior when no micro tier exists).
+        first_fib = next((l for l in self.ladders if l.get('tier', 'fib') == 'fib'), self.ladders[0])
+        first_fib_buy_price = current_price * first_fib['buy_price_multiplier']
+        base_usdt_per_unit_fib = first_fib_buy_price * unit_size
 
         for ladder in self.ladders:
             ladder['buy_price'] = current_price * ladder['buy_price_multiplier']
@@ -98,10 +240,56 @@ class Strategy:
                            f"buy=${ladder['buy_price']:.2f}, sell=${ladder['sell_price']:.2f}. Skipping.")
                 continue
 
-            # True Martingale: USDT cost doubles each level (units × base_usdt_per_unit)
-            ladder['usdt_cost'] = ladder['units'] * base_usdt_per_unit
-            # Calculate BTC amount based on USDT cost and buy price
-            ladder['btc_amount'] = ladder['usdt_cost'] / ladder['buy_price']
+            tier = ladder.get('tier', 'fib')
+            if tier == 'micro':
+                ladder['btc_amount'] = micro_unit * ladder['units']
+                ladder['usdt_cost'] = ladder['btc_amount'] * ladder['buy_price']
+            else:
+                ladder['usdt_cost'] = ladder['units'] * base_usdt_per_unit_fib
+                ladder['btc_amount'] = ladder['usdt_cost'] / ladder['buy_price']
+
+    def _update_sell_ladder_prices(self, current_price):
+        """Update SELL accumulation ladder prices and quantities.
+
+        Each ladder sells `units × unit_size_zec` coins. Buyback price is
+        capped at sell_price / (1 + coin_profit_percent) so the buyback
+        ALWAYS yields more coins than were sold, regardless of how the
+        ladder structure stacks.
+        """
+        if not self.sell_ladders:
+            return
+
+        accum = self.config.get('accumulation') or {}
+        coin_profit = max(0.0, float(accum.get('coin_profit_percent', 0.005)))
+        unit_size_key = f"unit_size_{self.config['pair'][:3].lower()}"
+        unit_size = float(accum.get(unit_size_key, 0.05))
+
+        micro_cfg = accum.get('micro_layer') or {}
+        micro_unit = float(micro_cfg.get(unit_size_key, unit_size * 0.6)) if micro_cfg.get('enabled') else 0
+
+        for ladder in self.sell_ladders:
+            ladder['sell_price'] = current_price * ladder['sell_price_multiplier']
+            structural_buyback = current_price * ladder['buyback_price_multiplier']
+
+            if ladder['sell_price'] <= 0:
+                logger.error(f"Invalid SELL price at accum level {ladder['level']}: "
+                           f"${ladder['sell_price']:.4f}. Skipping.")
+                continue
+
+            tier = ladder.get('tier', 'fib')
+            base_unit = micro_unit if tier == 'micro' else unit_size
+            ladder['coin_amount'] = base_unit * ladder['units']
+
+            # Cap buyback so we ALWAYS gain coins (sell_price / (1+profit)
+            # gives qty back × (1+profit)). Take the lower of structural and
+            # capped → guarantees coin gain even if structure is degenerate.
+            profit_capped_buyback = ladder['sell_price'] / (1.0 + coin_profit)
+            ladder['buyback_price'] = min(structural_buyback, profit_capped_buyback)
+            ladder['expected_buyback_qty'] = ladder['coin_amount'] * (
+                ladder['sell_price'] / ladder['buyback_price']
+            )
+            ladder['expected_coin_gain'] = ladder['expected_buyback_qty'] - ladder['coin_amount']
+            ladder['usdt_received'] = ladder['coin_amount'] * ladder['sell_price']
 
     def get_active_ladders(self):
         """Get ladders that are currently active (bought but not sold)"""
@@ -164,6 +352,62 @@ class Strategy:
     def is_distribution_mode(self):
         """Check whether this strategy uses distribution order placement."""
         return self.config.get('order_placement', {}).get('mode') == 'distribution'
+
+    def is_accumulation_enabled(self):
+        """Check whether SELL-side coin accumulation is configured."""
+        return bool((self.config.get('accumulation') or {}).get('enabled'))
+
+    def get_accumulation_config(self):
+        """Return accumulation-mode config with defaults applied.
+
+        SELL-side accumulation runs in parallel with the BUY ladder. When the
+        market rallies and a SELL_ACCUM fills, an immediate BUY_BACK is
+        placed at sell_price / (1 + coin_profit_percent), so each round-trip
+        delivers MORE coins than were sold (capped to guarantee a coin gain).
+
+        Keys:
+          - enabled: master switch (default False — opt-in)
+          - coin_profit_percent: minimum coin gain per round-trip (e.g. 0.005
+            = 0.5% more coins back per cycle)
+          - proximity_percent: place SELL when current price is within X% of
+            its sell_price (mirrors BUY-side proximity)
+          - max_open_sells_cap: hard cap on simultaneous SELL_ACCUM orders
+          - reserve_coin_percent: keep this fraction of the coin allocation
+            unbooked (safety buffer for fees and rounding)
+        """
+        accum = self.config.get('accumulation') or {}
+        return {
+            'enabled': bool(accum.get('enabled', False)),
+            'coin_profit_percent': float(accum.get('coin_profit_percent', 0.005)),
+            'proximity_percent': float(accum.get('proximity_percent', 0.006)),
+            'max_open_sells_cap': int(accum.get('max_open_sells_cap', 30)),
+            'reserve_coin_percent': float(accum.get('reserve_coin_percent', 0.05)),
+        }
+
+    def get_pending_sell_ladders(self):
+        """Get accumulation SELL ladders waiting to be triggered."""
+        return [l for l in self.sell_ladders if l['status'] == 'pending']
+
+    def get_active_sell_ladders(self):
+        """Get accumulation SELL ladders currently placed on the exchange."""
+        return [l for l in self.sell_ladders if l['status'] in ('placed', 'awaiting_buyback')]
+
+    def reset_sell_ladders(self):
+        """Reset closed accumulation ladders to pending for next cycle."""
+        reset_count = 0
+        for ladder in self.sell_ladders:
+            if ladder['status'] == 'closed':
+                ladder['status'] = 'pending'
+                reset_count += 1
+        if reset_count:
+            logger.info(f"Reset {reset_count} SELL ladders to pending for new cycle")
+
+    def all_sell_ladders_closed(self):
+        """All sell ladders have completed accumulation cycle."""
+        if not self.sell_ladders:
+            return True
+        return all(l['status'] == 'closed' for l in self.sell_ladders if l['status'] != 'pending') and \
+               any(l['status'] == 'closed' for l in self.sell_ladders)
 
     def get_recovery_config(self):
         """Return recovery-mode config with defaults applied.
@@ -386,6 +630,7 @@ class Strategy:
             'name': self.config['name'],
             'pair': self.config['pair'],
             'ladders': self.ladders,
-            'total_swing': self.ladders[-1]['cumulative_gap_percent'],
-            'required_capital': self.calculate_required_capital()
+            'sell_ladders': self.sell_ladders,
+            'total_swing': self.ladders[-1]['cumulative_gap_percent'] if self.ladders else 0,
+            'required_capital': self.calculate_required_capital(),
         }

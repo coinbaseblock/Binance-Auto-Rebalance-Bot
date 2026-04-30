@@ -32,6 +32,12 @@ class OrderManager:
         # Throttle for stale-SELL scans so we don't hammer the exchange.
         # {strategy_name: last_check_unix_ts}
         self._last_stale_check = {}
+        # Accumulation (SELL-then-BUY-back) cycle stats.
+        # {strategy_name: {
+        #     'coin_gain_total': float,    # cumulative coins gained from cycles
+        #     'cycles_completed': int,     # number of full SELL→BUY round-trips
+        # }}
+        self._accumulation_stats = {}
 
     def place_ladder_buy_orders(self, strategy, current_price):
         """Place buy orders for all pending ladders, respecting balance and exchange filters"""
@@ -959,6 +965,252 @@ class OrderManager:
         # Recovery cycle complete — clear pool so the next drawdown starts fresh.
         self._recovery_lots.pop(strategy_name, None)
 
+    # ---- Accumulation (SELL-then-BUY-back) --------------------------------
+
+    def is_accumulation_enabled(self, strategy):
+        """Check whether SELL-side accumulation is configured for this strategy."""
+        return strategy.is_accumulation_enabled()
+
+    def log_planned_sell_ladders(self, strategy):
+        """Log all planned SELL accumulation ladders so user sees the plan."""
+        if not strategy.is_accumulation_enabled():
+            return
+        strategy_name = strategy.config['name']
+        if not strategy.sell_ladders:
+            return
+        accum_cfg = strategy.get_accumulation_config()
+        logger.info(f"[{strategy_name}] Planned SELL (accumulation) ladders "
+                    f"(coin_profit_percent={accum_cfg['coin_profit_percent']:.2%}, "
+                    f"proximity={accum_cfg['proximity_percent']:.2%}):")
+        for ladder in strategy.sell_ladders:
+            sell_price = ladder.get('sell_price', 0)
+            buyback_price = ladder.get('buyback_price', 0)
+            coin_amount = ladder.get('coin_amount', 0)
+            expected_gain = ladder.get('expected_coin_gain', 0)
+            tier = ladder.get('tier', 'fib')
+            logger.info(f"  Lvl +{ladder['level']:>2} [{tier:>5}]: "
+                       f"SELL @ ${sell_price:>10.2f} | "
+                       f"BUYBACK @ ${buyback_price:>10.2f} | "
+                       f"Sell Qty: {coin_amount:.4f} ({ladder['units']}x) | "
+                       f"Coin Gain: +{expected_gain:.6f}")
+
+    def place_accumulation_orders(self, strategy, current_price):
+        """Promote pending SELL accumulation ladders whose price is in range.
+
+        Mirrors place_distribution_orders: only places SELL when the market
+        price is within proximity_percent below the ladder's sell price (or
+        already at/above it). Hard-fails (raises) when coin balance is
+        insufficient so the user gets a clear error in logs.
+
+        Returns list of orders placed this call (may be empty).
+        """
+        if not strategy.is_accumulation_enabled():
+            return []
+
+        strategy_name = strategy.config['name']
+        symbol = strategy.config['pair']
+        accum_cfg = strategy.get_accumulation_config()
+        proximity = accum_cfg['proximity_percent']
+        cap = accum_cfg['max_open_sells_cap']
+
+        pending = strategy.get_pending_sell_ladders()
+        if not pending:
+            return []
+
+        # Cap on simultaneous accumulation SELLs (counts only SELL_ACCUM and
+        # BUY_BACK from THIS strategy so it doesn't fight with the BUY-side
+        # distribution cap).
+        active_accum = sum(
+            1 for od in self.active_orders.values()
+            if od.get('strategy') == strategy_name
+            and od.get('type') in ('SELL_ACCUM', 'BUY_BACK')
+        )
+
+        placed = []
+        for ladder in sorted(pending, key=lambda l: l['sell_price']):
+            if active_accum >= cap:
+                logger.debug(f"[{strategy_name}] Accumulation cap ({cap}) reached, "
+                             f"{len(pending) - len(placed)} sell ladders still pending")
+                break
+
+            sell_price = ladder.get('sell_price', 0)
+            if sell_price <= 0:
+                continue
+
+            # Promote when price is at/above sell price OR within proximity below it.
+            if current_price >= sell_price:
+                should_promote = True
+            else:
+                distance = (sell_price - current_price) / sell_price
+                should_promote = distance <= proximity
+
+            if not should_promote:
+                # Sorted bottom-first; if this one isn't in range, higher
+                # ones definitely aren't either.
+                break
+
+            order = self._place_accumulation_sell(strategy, ladder)
+            if order is not None:
+                placed.append(order)
+                active_accum += 1
+
+        return placed
+
+    def _place_accumulation_sell(self, strategy, ladder):
+        """Place one SELL_ACCUM order; raise on insufficient coin balance.
+
+        Per spec: if we don't have enough coins to honour the SELL, surface
+        a clear error rather than silently skipping (the user explicitly
+        asked for "ขายไม่ได้ให้ขึ้น error และลง log").
+        """
+        strategy_name = strategy.config['name']
+        symbol = strategy.config['pair']
+        base_asset = symbol.replace('USDT', '').replace('BUSD', '').replace('USDC', '')
+
+        sell_price = ladder['sell_price']
+        coin_amount = ladder['coin_amount']
+
+        try:
+            balance = self.client.get_account_balance(base_asset)
+            available = balance['free']
+        except Exception as e:
+            logger.error(f"[{strategy_name}] Cannot fetch {base_asset} balance: {e}")
+            return None
+
+        accum_cfg = strategy.get_accumulation_config()
+        reserve = accum_cfg['reserve_coin_percent']
+        usable = available * (1.0 - reserve)
+
+        if coin_amount > usable:
+            msg = (f"[{strategy_name}] INSUFFICIENT {base_asset} BALANCE for SELL accum "
+                   f"Lvl +{ladder['level']}: need {coin_amount:.6f} {base_asset} "
+                   f"(reserve {reserve:.0%}, usable {usable:.6f} of {available:.6f}). "
+                   f"Deposit more {base_asset} or reduce accumulation.unit_size_zec.")
+            logger.error(msg)
+            raise RuntimeError(msg)
+
+        ok, reason = self.client.check_percent_price_filter(symbol, 'SELL', sell_price)
+        if not ok:
+            logger.warning(f"[{strategy_name}] Skipping accum SELL Lvl +{ladder['level']}: {reason}")
+            return None
+
+        try:
+            order = self.client.create_limit_order(
+                symbol=symbol, side='SELL',
+                quantity=coin_amount, price=sell_price,
+            )
+        except Exception as e:
+            logger.error(f"[{strategy_name}] Failed to place accum SELL Lvl +{ladder['level']}: {e}")
+            return None
+
+        self.active_orders[order['orderId']] = {
+            'strategy': strategy_name,
+            'level': ladder['level'],
+            'type': 'SELL_ACCUM',
+            'order': order,
+            'sell_ladder': ladder,
+        }
+        ladder['status'] = 'placed'
+        logger.info(f"[{strategy_name}] Accum SELL placed: Lvl +{ladder['level']} "
+                   f"@ ${sell_price:.4f} qty={coin_amount:.6f} (target buyback "
+                   f"@ ${ladder['buyback_price']:.4f}, +{strategy.get_accumulation_config()['coin_profit_percent']:.2%} coins)")
+        return order
+
+    def _place_buyback_buy(self, strategy, sell_ladder, filled_qty, filled_sell_price):
+        """Place BUY_BACK after a SELL_ACCUM filled.
+
+        Buyback price = MIN(structural buyback, sell_price / (1 + coin_profit))
+        — the cap guarantees the buyback yields more coins than were sold.
+        Buyback qty = filled_qty × (sell_price / buyback_price), so the
+        coin gain ≈ filled_qty × coin_profit_percent (or better).
+
+        Returns the placed BUY order or None on failure.
+        """
+        strategy_name = strategy.config['name']
+        symbol = strategy.config['pair']
+        accum_cfg = strategy.get_accumulation_config()
+        coin_profit = accum_cfg['coin_profit_percent']
+
+        # Always respect the profit cap, even if structural buyback is lower
+        # (deeper levels). We want at minimum +coin_profit% in coins back.
+        cap_price = filled_sell_price / (1.0 + coin_profit)
+        structural = float(sell_ladder.get('buyback_price') or cap_price)
+        buyback_price = min(structural, cap_price)
+        if buyback_price <= 0:
+            logger.error(f"[{strategy_name}] Invalid buyback price for Lvl +{sell_ladder['level']}; "
+                        f"sell_price={filled_sell_price}, cap={cap_price}, structural={structural}")
+            return None
+
+        # USDT proceeds from the SELL → buy back as many coins as that
+        # amount lets us at the buyback price. This is what locks in the
+        # coin gain.
+        usdt_proceeds = filled_qty * filled_sell_price
+        buyback_qty = usdt_proceeds / buyback_price
+
+        ok, reason = self.client.check_percent_price_filter(symbol, 'BUY', buyback_price)
+        if not ok:
+            logger.warning(f"[{strategy_name}] BUYBACK Lvl +{sell_ladder['level']} rejected by "
+                          f"price filter: {reason}; will retry on next stale scan")
+            sell_ladder['status'] = 'awaiting_buyback'
+            sell_ladder['pending_buyback'] = {
+                'qty_to_recover': buyback_qty,
+                'sold_qty': filled_qty,
+                'sold_price': filled_sell_price,
+            }
+            return None
+
+        try:
+            order = self.client.create_limit_order(
+                symbol=symbol, side='BUY',
+                quantity=buyback_qty, price=buyback_price,
+            )
+        except Exception as e:
+            logger.error(f"[{strategy_name}] BUYBACK placement failed Lvl +{sell_ladder['level']}: {e}")
+            sell_ladder['status'] = 'awaiting_buyback'
+            sell_ladder['pending_buyback'] = {
+                'qty_to_recover': buyback_qty,
+                'sold_qty': filled_qty,
+                'sold_price': filled_sell_price,
+            }
+            return None
+
+        self.active_orders[order['orderId']] = {
+            'strategy': strategy_name,
+            'level': sell_ladder['level'],
+            'type': 'BUY_BACK',
+            'order': order,
+            'sell_ladder': sell_ladder,
+            'sold_qty': filled_qty,
+            'sold_price': filled_sell_price,
+            'expected_buyback_qty': buyback_qty,
+        }
+        sell_ladder['status'] = 'awaiting_buyback'
+        sell_ladder['pending_buyback'] = None
+        expected_gain = buyback_qty - filled_qty
+        logger.info(f"[{strategy_name}] BUYBACK placed: Lvl +{sell_ladder['level']} "
+                   f"BUY {buyback_qty:.6f} @ ${buyback_price:.4f} "
+                   f"(sold {filled_qty:.6f} @ ${filled_sell_price:.4f}, "
+                   f"target coin gain +{expected_gain:.6f})")
+        return order
+
+    def _record_buyback_fill(self, strategy_name, sell_ladder, sold_qty, bought_qty):
+        """Update accumulation stats after a BUY_BACK fills."""
+        stats = self._accumulation_stats.setdefault(strategy_name, {
+            'coin_gain_total': 0.0, 'cycles_completed': 0,
+        })
+        gain = bought_qty - sold_qty
+        stats['coin_gain_total'] += gain
+        stats['cycles_completed'] += 1
+        sell_ladder['status'] = 'closed'
+        sell_ladder['last_coin_gain'] = gain
+        logger.info(f"[{strategy_name}] Accumulation cycle #{stats['cycles_completed']} "
+                   f"complete: sold {sold_qty:.6f} → bought {bought_qty:.6f} "
+                   f"(gain +{gain:.6f}, cumulative +{stats['coin_gain_total']:.6f})")
+
+    def reset_accumulation_state(self, strategy_name):
+        """Clear accumulation state for a strategy (e.g. on full reset)."""
+        self._accumulation_stats.pop(strategy_name, None)
+
     def log_planned_ladders(self, strategy):
         """Log all planned ladder levels with prices so user knows what will be placed."""
         strategy_name = strategy.config['name']
@@ -1026,13 +1278,42 @@ class OrderManager:
                     # bookkeeping so multiple children per ladder don't collide.
                     if otype == 'SELL_MERGED':
                         position_level = None  # handled by _handle_merged_sell_fill
+                    elif otype in ('SELL_ACCUM', 'BUY_BACK'):
+                        position_level = None  # handled inline below
                     else:
                         position_level = (
                             (order_data['level'], child['idx']) if child
                             else order_data['level']
                         )
 
-                    if otype == 'BUY':
+                    if otype == 'SELL_ACCUM':
+                        # Accumulation SELL filled: trigger BUY_BACK placement.
+                        # Note: we don't update Portfolio here — accumulation
+                        # operates on coins already in the wallet, not on
+                        # the BUY-ladder's tracked positions. P&L is tracked
+                        # in coin units via _accumulation_stats.
+                        sell_ladder = order_data.get('sell_ladder') or {}
+                        filled_price = float(status.get('price') or sell_ladder.get('sell_price') or 0)
+                        filled_qty = float(status.get('executedQty') or sell_ladder.get('coin_amount') or 0)
+                        sell_ladder['filled_price'] = filled_price
+                        sell_ladder['filled_qty'] = filled_qty
+                        logger.info(f"[{order_data['strategy']}] Accum SELL filled: "
+                                   f"Lvl +{order_data['level']} {filled_qty:.6f} @ ${filled_price:.4f}")
+                        # Defer the buyback placement — main loop will inspect
+                        # `filled` and call _place_buyback_buy with the live
+                        # strategy reference (we don't have it here).
+                        order_data['needs_buyback'] = True
+
+                    elif otype == 'BUY_BACK':
+                        sell_ladder = order_data.get('sell_ladder') or {}
+                        bought_qty = float(status.get('executedQty') or 0)
+                        sold_qty = float(order_data.get('sold_qty') or 0)
+                        self._record_buyback_fill(
+                            order_data['strategy'], sell_ladder,
+                            sold_qty=sold_qty, bought_qty=bought_qty,
+                        )
+
+                    elif otype == 'BUY':
                         self.portfolio.add_position(
                             strategy_name=order_data['strategy'],
                             ladder_level=position_level,

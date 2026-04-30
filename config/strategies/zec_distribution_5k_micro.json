@@ -2,14 +2,41 @@
   "enabled": true,
   "name": "ZEC Distribution 5K + Micro",
   "pair": "ZECUSDT",
-  "description": "Hybrid: keeps the 8-ladder structure of zec_distribution_5k (base_gap 4%, fib up to 21, gap_max 60%, unit_size 0.5 ZEC) so deep swings still trigger the same big buys, but borrows the 'always-trading' feel of zec_micro_test by using smaller children ($12), tighter take-profit (0.5%), eager proximity (0.6%), and a higher child cap so the topmost ladder splits into many small orders that fill on tiny bounces.",
+  "description": "Hybrid two-tier ladder + SELL-side coin accumulation. BUY side: 4 micro ladders (0.4-1.6% below) for 'always trading' feel + 8 fibonacci ladders (4-60% below) for big swings. SELL side: mirror structure above market (4 micro + 8 fib) — each SELL is auto-paired with a BUY-back at sell_price/(1+coin_profit_percent), guaranteeing more coins back than sold each round-trip (~0.5% coin gain per cycle). USDT side gains USDT, coin side gains ZEC. Both sides operate concurrently.",
 
   "ladder_config": {
     "base_gap": 0.04,
     "gap_max": 0.60,
     "ladders": 8,
     "fibonacci": [1, 1, 2, 3, 5, 8, 13, 21],
-    "unit_size_zec": 0.5
+    "unit_size_zec": 0.5,
+    "micro_layer": {
+      "enabled": true,
+      "count": 4,
+      "gap": 0.004,
+      "fibonacci": [1, 1, 2, 3],
+      "unit_size_zec": 0.04
+    }
+  },
+
+  "accumulation": {
+    "enabled": true,
+    "base_gap": 0.04,
+    "gap_max": 0.60,
+    "ladders": 8,
+    "fibonacci": [1, 1, 2, 3, 5, 8, 13, 21],
+    "unit_size_zec": 0.05,
+    "coin_profit_percent": 0.005,
+    "proximity_percent": 0.006,
+    "max_open_sells_cap": 30,
+    "reserve_coin_percent": 0.05,
+    "micro_layer": {
+      "enabled": true,
+      "count": 4,
+      "gap": 0.004,
+      "fibonacci": [1, 1, 2, 3],
+      "unit_size_zec": 0.04
+    }
   },
 
   "capital_allocation": {
@@ -34,7 +61,7 @@
     "child_order_usdt": 12.0,
     "proximity_percent": 0.006,
     "max_open_orders_cap": 220,
-    "min_children_per_ladder": 2,
+    "min_children_per_ladder": 1,
     "max_children_per_ladder": 16,
     "spread_mode": "geometric",
     "child_profit_percent": 0.005,
