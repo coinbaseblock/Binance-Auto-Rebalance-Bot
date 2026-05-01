@@ -32,6 +32,9 @@ class OrderManager:
         # Throttle for stale-SELL scans so we don't hammer the exchange.
         # {strategy_name: last_check_unix_ts}
         self._last_stale_check = {}
+        # Throttle for stale-BUY auto-cancel scans (different cadence/policy
+        # than the SELL stale check). {strategy_name: last_check_unix_ts}
+        self._last_stale_buy_check = {}
         # Accumulation (SELL-then-BUY-back) cycle stats.
         # {strategy_name: {
         #     'coin_gain_total': float,    # cumulative coins gained from cycles
@@ -89,7 +92,8 @@ class OrderManager:
                     'level': ladder['level'],
                     'type': 'BUY',
                     'order': order,
-                    'ladder': ladder
+                    'ladder': ladder,
+                    'placed_at': time.time(),
                 }
 
                 orders_placed.append(order)
@@ -249,7 +253,8 @@ class OrderManager:
                 'level': ladder['level'],
                 'type': 'BUY',
                 'order': order,
-                'ladder': ladder
+                'ladder': ladder,
+                'placed_at': time.time(),
             }
 
             # Advance sequential state
@@ -353,15 +358,138 @@ class OrderManager:
         logger.info(f"[{strategy_name}] Distribution queue initialized with {len(queue)} children")
 
     def place_distribution_orders(self, strategy, current_price):
-        """Entry point for distribution mode: build pending queue (if empty)
-        and promote children whose price is near the market and that fit within
-        the per-symbol open-order cap.
+        """Entry point for distribution mode: build pending queue (if empty),
+        recycle stale BUY orders to free up cap slots, then promote children
+        whose price is near the market.
 
         Returns list of orders placed this call (may be empty when nothing is
         yet in proximity).
         """
         self.prime_distribution_queue(strategy)
+        # Free up slots from far-and-old BUYs before trying to promote new
+        # ones — otherwise the cap can wedge us out of placing closer orders.
+        self._scan_stale_buys(strategy, current_price)
         return self._promote_pending_children(strategy, current_price)
+
+    @staticmethod
+    def _extract_order_time(order_obj):
+        """Return a unix timestamp for when ``order_obj`` was created.
+
+        Binance order payloads carry ``time`` (ms since epoch); fall back to
+        ``transactTime`` and finally to "now" so newly-adopted orphans without
+        a recorded time aren't immediately treated as ancient.
+        """
+        for key in ('time', 'transactTime'):
+            raw = (order_obj or {}).get(key)
+            if raw:
+                try:
+                    return float(raw) / 1000.0
+                except (TypeError, ValueError):
+                    pass
+        return time.time()
+
+    def _scan_stale_buys(self, strategy, current_price):
+        """Cancel BUY orders that are both old AND far below the market.
+
+        When the bot has been running through a sideways or rising market,
+        deep BUYs from earlier dips can pile up against the per-symbol open-
+        order cap, blocking the placement of *closer* (more useful) BUYs.
+        This scan reclaims those slots: a BUY is recycled when
+
+          - it has been sitting open for more than ``stale_buy_max_age_seconds``
+            AND
+          - it sits more than ``stale_buy_distance_threshold`` below the
+            current price (so it is unlikely to fill any time soon).
+
+        Cancelled BUYs are dropped from ``active_orders`` and the underlying
+        child returns to the pending queue, so the regular proximity check
+        will re-place it when the market actually approaches its price.
+
+        Disabled when ``stale_buy_max_age_seconds`` is 0 / unset. Throttled
+        by ``stale_buy_check_interval_seconds`` so we don't hammer the
+        exchange every loop tick.
+        """
+        if current_price is None or current_price <= 0:
+            return 0
+        placement = strategy.config.get('order_placement', {}) or {}
+        max_age = float(placement.get('stale_buy_max_age_seconds', 0) or 0)
+        if max_age <= 0:
+            return 0
+        distance_threshold = float(
+            placement.get('stale_buy_distance_threshold', 0.05) or 0.05
+        )
+        check_interval = float(
+            placement.get('stale_buy_check_interval_seconds', 600) or 600
+        )
+
+        strategy_name = strategy.config['name']
+        symbol = strategy.config['pair']
+        now = time.time()
+        last = self._last_stale_buy_check.get(strategy_name, 0)
+        if now - last < check_interval:
+            return 0
+        self._last_stale_buy_check[strategy_name] = now
+
+        cancelled = 0
+        queue = self._pending_children.setdefault(strategy_name, [])
+
+        for oid, od in list(self.active_orders.items()):
+            if od.get('strategy') != strategy_name:
+                continue
+            if od.get('type') != 'BUY':
+                continue
+            order_obj = od.get('order') or {}
+            try:
+                buy_price = float(order_obj.get('price') or 0)
+            except (TypeError, ValueError):
+                continue
+            if buy_price <= 0 or buy_price >= current_price:
+                continue
+            distance = (current_price - buy_price) / current_price
+            if distance < distance_threshold:
+                continue
+            placed_at = od.get('placed_at') or 0
+            age = now - placed_at if placed_at else 0
+            if age < max_age:
+                continue
+
+            try:
+                self.client.cancel_order(symbol=symbol, order_id=oid)
+            except Exception as e:
+                logger.warning(
+                    f"[{strategy_name}] Stale BUY cancel failed for {oid}: {e}"
+                )
+                continue
+
+            self.active_orders.pop(oid, None)
+            child = od.get('child')
+            parent = od.get('ladder')
+            if child is not None:
+                child['status'] = 'pending'
+                if parent is not None:
+                    parent['children_placed'] = max(
+                        0, int(parent.get('children_placed', 1)) - 1
+                    )
+                # Return to pending queue so the proximity check can re-place
+                # it once the market actually approaches.
+                if child not in queue:
+                    queue.append(child)
+            cancelled += 1
+            logger.info(
+                f"[{strategy_name}] Stale BUY recycled: orderId={oid} "
+                f"L{od.get('level')} @ ${buy_price:.4f} "
+                f"(age {age / 60:.1f}min, {distance:.2%} below market) "
+                f"— slot freed for closer orders"
+            )
+
+        if cancelled:
+            # Re-sort the queue top-first so promotion logic still picks the
+            # closest-to-market child next.
+            queue.sort(key=lambda c: c['buy_price'], reverse=True)
+            logger.info(
+                f"[{strategy_name}] Stale-BUY scan recycled {cancelled} order(s)"
+            )
+        return cancelled
 
     def _promote_pending_children(self, strategy, current_price):
         """Promote pending children to Binance when price is in proximity and
@@ -500,6 +628,7 @@ class OrderManager:
                 'order': order,
                 'ladder': parent_ladder,
                 'child': child,
+                'placed_at': time.time(),
             }
             child['status'] = 'placed'
             parent_ladder['children_placed'] = parent_ladder.get('children_placed', 0) + 1
@@ -1518,6 +1647,7 @@ class OrderManager:
                             'order': ex_order,
                             'ladder': parent_ladder,
                             'child': child,
+                            'placed_at': self._extract_order_time(ex_order),
                         }
                         child['status'] = 'placed'
                         parent_ladder['children_placed'] = parent_ladder.get('children_placed', 0) + 1
@@ -1543,6 +1673,7 @@ class OrderManager:
                         'type': side,
                         'order': ex_order,
                         'ladder': ladder,
+                        'placed_at': self._extract_order_time(ex_order),
                     }
                     logger.info(
                         f"Adopted orphan {side}: {strategy.config['name']} "

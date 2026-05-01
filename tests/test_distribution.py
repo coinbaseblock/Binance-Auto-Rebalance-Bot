@@ -459,6 +459,13 @@ class _NotionalFakeClient:
         self.placed.append((side, float(quantity), float(price)))
         return order
 
+    def cancel_order(self, symbol, order_id):
+        order = self.client.orders.get(order_id)
+        if order is None:
+            raise RuntimeError(f"unknown order {order_id}")
+        order['status'] = 'CANCELED'
+        return order
+
 
 def _zec_distribution_strategy_path():
     """Build a config that, before the fix, produced sub-$5 top children for
@@ -582,5 +589,205 @@ class TestNotionalGuard:
             # At least the top child(ren) should have been placed.
             assert len(placed) >= 1
             assert all(p['side'] == 'BUY' for p in placed)
+        finally:
+            os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# Stale-BUY auto-cancel
+# ---------------------------------------------------------------------------
+
+def _stale_buy_strategy_path(extra_placement=None):
+    """Distribution strategy with stale-BUY auto-cancel enabled by default."""
+    placement = {
+        "mode": "distribution",
+        "child_order_usdt": 25.0,
+        "proximity_percent": 0.02,
+        "max_open_orders_cap": 180,
+        "min_children_per_ladder": 1,
+        "max_children_per_ladder": 12,
+        "spread_mode": "geometric",
+        "child_profit_percent": 0.012,
+        "child_sell_mode": "min_of_both",
+        "stale_buy_max_age_seconds": 3600,
+        "stale_buy_distance_threshold": 0.04,
+        "stale_buy_check_interval_seconds": 0,  # disable throttle for tests
+    }
+    if extra_placement:
+        placement.update(extra_placement)
+    cfg = {
+        "enabled": True,
+        "name": "ZEC Stale-BUY Test",
+        "pair": "ZECUSDT",
+        "description": "stale-BUY recycle test",
+        "ladder_config": {
+            "base_gap": 0.04,
+            "gap_max": 0.60,
+            "ladders": 8,
+            "fibonacci": [1, 1, 2, 3, 5, 8, 13, 21],
+            "size_mode": "fibonacci",
+            "unit_size_zec": 0.5,
+        },
+        "capital_allocation": {"max_allocation_percent": 1.0, "reserve_percent": 0.10},
+        "risk_management": {"safety_multiplier": 1.5, "stop_loss_percent": -0.50,
+                            "take_profit_percent": 0.25},
+        "execution": {"auto_rebalance": True, "rebalance_interval_hours": 12,
+                      "min_profit_to_close": 0.005},
+        "order_placement": placement,
+    }
+    f = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+    json.dump(cfg, f)
+    f.close()
+    return f.name
+
+
+def _seed_stale_buy(om, strategy, *, buy_price, current_price, age_seconds):
+    """Inject a fake-but-valid BUY into active_orders with the given age.
+
+    Returns (order_id, child_dict) so tests can assert on either.
+    """
+    import time as _time
+    ladder = strategy.ladders[0]
+    ladder.setdefault('children_total', 1)
+    ladder.setdefault('children_closed', 0)
+    ladder['children_placed'] = ladder.get('children_placed', 0) + 1
+    child = {
+        'idx': 0,
+        'parent_level': ladder['level'],
+        'buy_price': buy_price,
+        'sell_price': buy_price * 1.01,
+        'usdt_cost': buy_price * 0.5,
+        'qty': 0.5,
+        'status': 'placed',
+        'parent_ladder': ladder,
+    }
+    order = om.client.create_limit_order(
+        strategy.config['pair'], 'BUY', child['qty'], buy_price
+    )
+    om.active_orders[order['orderId']] = {
+        'strategy': strategy.config['name'],
+        'level': child['parent_level'],
+        'type': 'BUY',
+        'order': order,
+        'ladder': ladder,
+        'child': child,
+        'placed_at': _time.time() - age_seconds,
+    }
+    om._pending_children.setdefault(strategy.config['name'], [])
+    return order['orderId'], child
+
+
+class TestStaleBuyRecycle:
+    def test_recycles_old_far_buy_back_to_pending(self):
+        """A BUY that is both old AND far below market is cancelled and the
+        child returns to the pending queue for later re-promotion."""
+        path = _stale_buy_strategy_path()
+        try:
+            s = Strategy(path)
+            s.update_prices(380.0)
+            client = _NotionalFakeClient(min_notional=5.0)
+            om = OrderManager(client, Portfolio(5000.0))
+            oid, child = _seed_stale_buy(
+                om, s, buy_price=320.0, current_price=380.0, age_seconds=7200
+            )
+
+            cancelled = om._scan_stale_buys(s, current_price=380.0)
+
+            assert cancelled == 1
+            assert oid not in om.active_orders, "stale BUY should be removed"
+            assert client.client.orders[oid]['status'] == 'CANCELED'
+            queue = om._pending_children[s.config['name']]
+            assert child in queue, "child should re-enter pending queue"
+            assert child['status'] == 'pending'
+        finally:
+            os.unlink(path)
+
+    def test_close_buy_is_left_alone_even_if_old(self):
+        """A BUY within the distance threshold is preserved — the bot still
+        wants it to fill on the next dip."""
+        path = _stale_buy_strategy_path()
+        try:
+            s = Strategy(path)
+            s.update_prices(380.0)
+            client = _NotionalFakeClient(min_notional=5.0)
+            om = OrderManager(client, Portfolio(5000.0))
+            # 2% below market (< 4% threshold), but very old.
+            oid, _ = _seed_stale_buy(
+                om, s, buy_price=372.4, current_price=380.0, age_seconds=86400
+            )
+
+            cancelled = om._scan_stale_buys(s, current_price=380.0)
+
+            assert cancelled == 0
+            assert oid in om.active_orders, "near-market BUY must not be cancelled"
+
+        finally:
+            os.unlink(path)
+
+    def test_fresh_far_buy_is_left_alone(self):
+        """A deep BUY that's still young keeps its slot — it might fill soon."""
+        path = _stale_buy_strategy_path()
+        try:
+            s = Strategy(path)
+            s.update_prices(380.0)
+            client = _NotionalFakeClient(min_notional=5.0)
+            om = OrderManager(client, Portfolio(5000.0))
+            oid, _ = _seed_stale_buy(
+                om, s, buy_price=300.0, current_price=380.0, age_seconds=60
+            )
+
+            cancelled = om._scan_stale_buys(s, current_price=380.0)
+
+            assert cancelled == 0
+            assert oid in om.active_orders
+        finally:
+            os.unlink(path)
+
+    def test_disabled_when_max_age_zero(self):
+        """stale_buy_max_age_seconds=0 leaves the legacy behaviour intact."""
+        path = _stale_buy_strategy_path(extra_placement={
+            'stale_buy_max_age_seconds': 0,
+        })
+        try:
+            s = Strategy(path)
+            s.update_prices(380.0)
+            client = _NotionalFakeClient(min_notional=5.0)
+            om = OrderManager(client, Portfolio(5000.0))
+            oid, _ = _seed_stale_buy(
+                om, s, buy_price=200.0, current_price=380.0, age_seconds=86400 * 30
+            )
+
+            cancelled = om._scan_stale_buys(s, current_price=380.0)
+
+            assert cancelled == 0
+            assert oid in om.active_orders, "disabled scan must not cancel anything"
+        finally:
+            os.unlink(path)
+
+    def test_throttle_blocks_repeat_scans(self):
+        """Once the scan runs, the throttle prevents a second scan within
+        the interval (so we don't hammer the exchange every loop tick)."""
+        path = _stale_buy_strategy_path(extra_placement={
+            'stale_buy_check_interval_seconds': 600,
+        })
+        try:
+            s = Strategy(path)
+            s.update_prices(380.0)
+            client = _NotionalFakeClient(min_notional=5.0)
+            om = OrderManager(client, Portfolio(5000.0))
+            _seed_stale_buy(
+                om, s, buy_price=300.0, current_price=380.0, age_seconds=7200
+            )
+
+            first = om._scan_stale_buys(s, current_price=380.0)
+            # Add another stale BUY and immediately scan again — throttle
+            # should keep the second scan from running.
+            _seed_stale_buy(
+                om, s, buy_price=290.0, current_price=380.0, age_seconds=7200
+            )
+            second = om._scan_stale_buys(s, current_price=380.0)
+
+            assert first == 1
+            assert second == 0, "second scan within throttle window must be a no-op"
         finally:
             os.unlink(path)
