@@ -198,6 +198,9 @@ class StateStore:
                 # Embed the full child dict so we can fully restore the link
                 # without needing the ladder to maintain a children list.
                 "child": self._serialize_child(child) if child is not None else None,
+                # Used by the stale-BUY auto-cancel — preserves age across
+                # restarts so a 12h-old order doesn't reset to "fresh".
+                "placed_at": od.get("placed_at"),
             }
             # Recovery-merged SELLs reference a list of pooled children rather
             # than a single child. Persist it so the lot can be reconstructed.
@@ -237,6 +240,9 @@ class StateStore:
             "pending_children": pending,
             "recovery_lots": recovery_lots,
             "last_stale_check": dict(getattr(om, "_last_stale_check", {})),
+            "last_stale_buy_check": dict(
+                getattr(om, "_last_stale_buy_check", {})
+            ),
             "accumulation_stats": dict(getattr(om, "_accumulation_stats", {})),
         }
 
@@ -372,6 +378,7 @@ class StateStore:
                 "order": od["order"],
                 "ladder": ladder,
                 "child": child,
+                "placed_at": od.get("placed_at"),
             }
 
         # Sequential state (plain dict round-trip)
@@ -411,6 +418,9 @@ class StateStore:
                 "merged_sell_qty": lot.get("merged_sell_qty"),
             }
         om._last_stale_check = dict(data.get("last_stale_check", {}) or {})
+        om._last_stale_buy_check = dict(
+            data.get("last_stale_buy_check", {}) or {}
+        )
         # Accumulation stats: cumulative coin gain across cycles. Default to
         # empty for older state files predating SELL-side accumulation.
         om._accumulation_stats = {

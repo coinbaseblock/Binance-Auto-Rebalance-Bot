@@ -21,6 +21,31 @@ def _generate_fibonacci(n):
     return fib[:n]
 
 
+# Valid sizing modes for the fib tier of BUY/SELL ladders. Micro tier is
+# always flat 1x — that's the whole point of "always trading" small lots.
+SIZE_MODES = ('martingale', 'fibonacci', 'fib_martingale')
+
+
+def _resolve_fib_units(size_mode, fib_value, idx):
+    """Compute the unit multiplier for a fib-tier ladder at index ``idx``.
+
+    Modes:
+      - "martingale" (legacy default): pure 2^i doubling, ignores fibonacci
+        config. Aggressive — deepest ladders need huge capital.
+      - "fibonacci": uses the configured fibonacci value directly. Each level
+        scales as the fib sequence (1, 1, 2, 3, 5, 8, 13, 21 …) — gentler
+        than 2^i and reachable with realistic capital.
+      - "fib_martingale": fib * 2^i. Combines both — extreme growth, only
+        useful with very few ladders.
+    """
+    if size_mode == 'fibonacci':
+        return max(1, int(fib_value))
+    if size_mode == 'fib_martingale':
+        return max(1, int(fib_value)) * (2 ** idx)
+    # default: 'martingale'
+    return 2 ** idx
+
+
 class Strategy:
     def __init__(self, config_path):
         self.config = self._load_config(config_path)
@@ -35,6 +60,26 @@ class Strategy:
             config = json.load(f)
         logger.info(f"Loaded strategy: {config['name']}")
         return config
+
+    @staticmethod
+    def _resolve_size_mode(value):
+        """Validate ``size_mode`` config; default to legacy 'martingale'.
+
+        We keep the default as 'martingale' (current 2^i behaviour) so
+        existing strategy JSON files behave identically. Strategies that
+        want true Fibonacci sizing must opt in via ``"size_mode":
+        "fibonacci"`` (or ``"fib_martingale"`` for fib × 2^i).
+        """
+        if value is None:
+            return 'martingale'
+        v = str(value).strip().lower()
+        if v not in SIZE_MODES:
+            logger.warning(
+                f"Unknown size_mode {value!r}; falling back to 'martingale'. "
+                f"Valid options: {SIZE_MODES}"
+            )
+            return 'martingale'
+        return v
 
     def _calculate_ladders(self):
         """Calculate BUY ladder levels using compound multiplicative gaps.
@@ -79,7 +124,10 @@ class Strategy:
                     'cumulative_gap_percent': 1 - buy_multiplier,
                     'buy_price_multiplier': buy_multiplier,
                     'sell_price_multiplier': sell_multiplier,
-                    'units': 1,  # micro ladders are flat-sized (no martingale)
+                    'units': 1,  # micro ladders stay flat-sized — keeps the
+                                 # "always trading" feel even when the fib tier
+                                 # is configured to scale aggressively.
+                    'size_mode': 'flat',
                     'status': 'pending',
                 })
                 idx += 1
@@ -89,6 +137,8 @@ class Strategy:
         fibonacci = ladder_config['fibonacci']
         num_ladders = ladder_config['ladders']
         gap_max = ladder_config.get('gap_max', 0.95)
+        size_mode = self._resolve_size_mode(ladder_config.get('size_mode'))
+        self._buy_size_mode = size_mode
 
         for i in range(num_ladders):
             fib = fibonacci[i]
@@ -106,13 +156,16 @@ class Strategy:
                 'cumulative_gap_percent': 1 - buy_multiplier,
                 'buy_price_multiplier': buy_multiplier,
                 'sell_price_multiplier': sell_multiplier,
-                'units': 2 ** i,  # Martingale within the fib tier
+                'units': _resolve_fib_units(size_mode, fib, i),
+                'size_mode': size_mode,
                 'status': 'pending',
             })
             idx += 1
 
         if self.ladders:
-            logger.info(f"Calculated {len(self.ladders)} BUY ladders with total swing: "
+            logger.info(f"Calculated {len(self.ladders)} BUY ladders "
+                        f"[fib size_mode={getattr(self, '_buy_size_mode', 'martingale')}] "
+                        f"with total swing: "
                         f"{self.ladders[-1]['cumulative_gap_percent']:.2%}")
         else:
             logger.info("No BUY ladders calculated")
@@ -163,7 +216,8 @@ class Strategy:
                     'cumulative_gap_percent': sell_multiplier - 1,
                     'sell_price_multiplier': sell_multiplier,
                     'buyback_price_multiplier': buyback_multiplier,
-                    'units': 1,
+                    'units': 1,  # micro stays flat (matches BUY-side micro)
+                    'size_mode': 'flat',
                     'status': 'pending',
                 })
                 idx += 1
@@ -173,6 +227,8 @@ class Strategy:
         fibonacci = accum.get('fibonacci') or [1, 1, 2, 3, 5, 8, 13, 21]
         num_ladders = int(accum.get('ladders', 8))
         gap_max = float(accum.get('gap_max', 0.60))
+        size_mode = self._resolve_size_mode(accum.get('size_mode'))
+        self._sell_size_mode = size_mode
 
         for i in range(num_ladders):
             fib = fibonacci[i] if i < len(fibonacci) else fibonacci[-1]
@@ -190,13 +246,15 @@ class Strategy:
                 'cumulative_gap_percent': sell_multiplier - 1,
                 'sell_price_multiplier': sell_multiplier,
                 'buyback_price_multiplier': buyback_multiplier,
-                'units': 2 ** i,
+                'units': _resolve_fib_units(size_mode, fib, i),
+                'size_mode': size_mode,
                 'status': 'pending',
             })
             idx += 1
 
         if self.sell_ladders:
             logger.info(f"Calculated {len(self.sell_ladders)} SELL (accumulation) ladders "
+                        f"[fib size_mode={getattr(self, '_sell_size_mode', 'martingale')}] "
                         f"with total swing: +{self.sell_ladders[-1]['cumulative_gap_percent']:.2%}")
 
     def update_prices(self, current_price):

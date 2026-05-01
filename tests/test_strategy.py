@@ -284,3 +284,113 @@ class TestGapClamp:
             assert s.ladders[8]['buy_price_multiplier'] > 0
         finally:
             os.unlink(temp_path)
+
+
+def _make_size_mode_strategy(size_mode, micro_enabled=False, accum_size_mode=None):
+    """Build a Strategy with the given fib-tier size_mode (and optional
+    matching SELL accumulation)."""
+    config = {
+        "enabled": True,
+        "name": "Size Mode Test",
+        "pair": "ZECUSDT",
+        "description": "size_mode unit test",
+        "ladder_config": {
+            "base_gap": 0.04,
+            "gap_max": 0.95,
+            "ladders": 8,
+            "fibonacci": [1, 1, 2, 3, 5, 8, 13, 21],
+            "unit_size_zec": 0.5,
+        },
+        "capital_allocation": {"max_allocation_percent": 1.0, "reserve_percent": 0.10},
+        "risk_management": {"safety_multiplier": 1.5, "stop_loss_percent": -0.5,
+                             "take_profit_percent": 0.25},
+        "execution": {"auto_rebalance": True, "rebalance_interval_hours": 12,
+                       "min_profit_to_close": 0.005},
+    }
+    if size_mode is not None:
+        config["ladder_config"]["size_mode"] = size_mode
+    if micro_enabled:
+        config["ladder_config"]["micro_layer"] = {
+            "enabled": True,
+            "count": 4,
+            "gap": 0.004,
+            "fibonacci": [1, 1, 2, 3],
+            "unit_size_zec": 0.04,
+        }
+    if accum_size_mode is not None:
+        config["accumulation"] = {
+            "enabled": True,
+            "base_gap": 0.04,
+            "ladders": 8,
+            "fibonacci": [1, 1, 2, 3, 5, 8, 13, 21],
+            "size_mode": accum_size_mode,
+            "unit_size_zec": 0.05,
+            "coin_profit_percent": 0.005,
+        }
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        json.dump(config, f)
+        temp_path = f.name
+    try:
+        return Strategy(temp_path)
+    finally:
+        os.unlink(temp_path)
+
+
+class TestSizeMode:
+    """size_mode controls the units multiplier used by the fib tier."""
+
+    def test_default_is_legacy_martingale(self):
+        """No size_mode → existing 2^i behaviour (preserves old strategies)."""
+        s = _make_size_mode_strategy(size_mode=None)
+        assert [l['units'] for l in s.ladders] == [1, 2, 4, 8, 16, 32, 64, 128]
+
+    def test_explicit_martingale(self):
+        s = _make_size_mode_strategy(size_mode='martingale')
+        assert [l['units'] for l in s.ladders] == [1, 2, 4, 8, 16, 32, 64, 128]
+
+    def test_fibonacci_uses_configured_sequence(self):
+        """size_mode='fibonacci' → units literally match the fib config."""
+        s = _make_size_mode_strategy(size_mode='fibonacci')
+        assert [l['units'] for l in s.ladders] == [1, 1, 2, 3, 5, 8, 13, 21]
+        # All ladders annotated with their size_mode for log clarity
+        for ladder in s.ladders:
+            assert ladder['size_mode'] == 'fibonacci'
+
+    def test_fib_martingale_is_fib_times_two_pow_i(self):
+        s = _make_size_mode_strategy(size_mode='fib_martingale')
+        expected = [1 * 1, 1 * 2, 2 * 4, 3 * 8, 5 * 16, 8 * 32, 13 * 64, 21 * 128]
+        assert [l['units'] for l in s.ladders] == expected
+
+    def test_unknown_mode_falls_back_to_martingale(self):
+        s = _make_size_mode_strategy(size_mode='nonsense')
+        assert [l['units'] for l in s.ladders] == [1, 2, 4, 8, 16, 32, 64, 128]
+
+    def test_micro_stays_flat_regardless_of_size_mode(self):
+        """User explicitly wants the micro 'always trading' tier kept flat."""
+        s = _make_size_mode_strategy(size_mode='fib_martingale', micro_enabled=True)
+        micro = [l for l in s.ladders if l.get('tier') == 'micro']
+        assert len(micro) == 4
+        for l in micro:
+            assert l['units'] == 1
+            assert l['size_mode'] == 'flat'
+
+    def test_sell_accumulation_honours_size_mode(self):
+        """SELL-side accumulation reads its own size_mode (independent of BUY)."""
+        s = _make_size_mode_strategy(
+            size_mode='martingale', accum_size_mode='fibonacci'
+        )
+        sell_units = [l['units'] for l in s.sell_ladders if l.get('tier') == 'fib']
+        assert sell_units == [1, 1, 2, 3, 5, 8, 13, 21]
+
+    def test_fibonacci_sizing_dramatically_smaller_than_martingale(self):
+        """Capital required for fib mode is a fraction of legacy 2^i."""
+        s_mart = _make_size_mode_strategy(size_mode='martingale')
+        s_fib = _make_size_mode_strategy(size_mode='fibonacci')
+        s_mart.update_prices(380.0)
+        s_fib.update_prices(380.0)
+        cap_mart = s_mart.calculate_required_capital()
+        cap_fib = s_fib.calculate_required_capital()
+        # Pure fib should need < 20% of pure martingale (54 vs 255 unit-sum).
+        assert cap_fib < cap_mart * 0.25, (
+            f"fib capital ${cap_fib:.0f} not <25% of martingale ${cap_mart:.0f}"
+        )
