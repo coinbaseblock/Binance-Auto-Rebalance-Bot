@@ -35,6 +35,10 @@ class OrderManager:
         # Throttle for stale-BUY auto-cancel scans (different cadence/policy
         # than the SELL stale check). {strategy_name: last_check_unix_ts}
         self._last_stale_buy_check = {}
+        # Strategy lookup so close handlers in check_filled_orders can read
+        # config and trigger per-ladder recycling without main.py wiring.
+        # Populated via register_strategies().
+        self._strategies_by_name = {}
         # Accumulation (SELL-then-BUY-back) cycle stats.
         # {strategy_name: {
         #     'coin_gain_total': float,    # cumulative coins gained from cycles
@@ -356,6 +360,103 @@ class OrderManager:
         queue.sort(key=lambda c: c['buy_price'], reverse=True)
         self._pending_children[strategy_name] = queue
         logger.info(f"[{strategy_name}] Distribution queue initialized with {len(queue)} children")
+
+    def register_strategies(self, strategies):
+        """Register all loaded strategies so close-time handlers can resolve
+        a Strategy object from a strategy name (e.g. for per-ladder recycle).
+
+        Idempotent — re-registering simply replaces the lookup table.
+        """
+        self._strategies_by_name = {
+            s.config['name']: s for s in strategies if s and s.config.get('name')
+        }
+
+    def _strategy_by_name(self, name):
+        """Return the registered Strategy for ``name`` (or None)."""
+        return self._strategies_by_name.get(name)
+
+    def _recycle_in_place_enabled(self, strategy_or_name):
+        """Whether the strategy opted into per-ladder in-place recycling.
+
+        Default False — preserves the legacy global-restart behaviour for
+        existing strategies. Strategies opt in with
+        ``order_placement.recycle_in_place: true``.
+        """
+        strategy = strategy_or_name
+        if isinstance(strategy_or_name, str):
+            strategy = self._strategy_by_name(strategy_or_name)
+        if strategy is None:
+            return False
+        placement = (strategy.config.get('order_placement') or {})
+        return bool(placement.get('recycle_in_place', False))
+
+    def _recycle_ladder_in_place(self, strategy_name, ladder):
+        """Re-arm a fully-closed BUY ladder *in place* — same buy/sell prices,
+        same child layout. Lets the bot keep cycling a level repeatedly without
+        triggering the global auto-restart (which re-anchors every other
+        ladder to the new market price, discarding the original fib targets
+        that were waiting on a deeper dip).
+        """
+        if ladder is None or ladder.get('status') != 'closed':
+            return
+        strategy = self._strategy_by_name(strategy_name)
+        if strategy is None:
+            logger.debug(f"[{strategy_name}] Recycle skipped — strategy not registered")
+            return
+
+        # Reset ladder counters
+        ladder['status'] = 'pending'
+        ladder['children_closed'] = 0
+        ladder['children_placed'] = 0
+
+        # Rebuild children from the ladder's existing buy/sell prices (NOT
+        # current market) so re-armed orders sit at the same targets.
+        min_notional = self._get_symbol_min_notional(strategy.config['pair'])
+        next_buy = None
+        for i, l in enumerate(strategy.ladders):
+            if l is ladder:
+                if i + 1 < len(strategy.ladders):
+                    next_buy = strategy.ladders[i + 1].get('buy_price')
+                break
+        children = strategy.calculate_child_orders(
+            ladder, next_buy, min_notional=min_notional
+        )
+        ladder['children_total'] = len(children)
+        for child in children:
+            child['parent_ladder'] = ladder
+
+        # Drop any stale pending children for this ladder before re-adding
+        # the freshly-rebuilt set. In normal flow the queue holds nothing for
+        # a closed ladder (everything got placed), but defending against
+        # half-promoted state keeps recycle idempotent.
+        queue = self._pending_children.setdefault(strategy_name, [])
+        queue[:] = [c for c in queue if c.get('parent_level') != ladder.get('level')]
+        queue.extend(children)
+        queue.sort(key=lambda c: c['buy_price'], reverse=True)
+
+        logger.info(
+            f"[{strategy_name}] Ladder L{ladder['level']} recycled in place "
+            f"(BUY @ ${ladder.get('buy_price', 0):.4f} → "
+            f"SELL @ ${ladder.get('sell_price', 0):.4f}, "
+            f"{len(children)} children re-armed)"
+        )
+
+    def _recycle_sell_ladder_in_place(self, strategy_name, sell_ladder):
+        """Re-arm a closed SELL accumulation ladder. SELL ladders don't have
+        children — they're a single SELL order pre-placed when price
+        approaches their target — so recycling is just resetting the status
+        flag back to pending.
+        """
+        if sell_ladder is None or sell_ladder.get('status') != 'closed':
+            return
+        sell_ladder['status'] = 'pending'
+        sell_ladder.pop('filled_qty', None)
+        sell_ladder.pop('filled_price', None)
+        sell_ladder.pop('pending_buyback', None)
+        logger.info(
+            f"[{strategy_name}] SELL ladder Lvl +{sell_ladder.get('level')} "
+            f"recycled in place (SELL @ ${sell_ladder.get('sell_price', 0):.4f})"
+        )
 
     def place_distribution_orders(self, strategy, current_price):
         """Entry point for distribution mode: build pending queue (if empty),
@@ -1089,6 +1190,9 @@ class OrderManager:
             if parent.get('children_total', 0) > 0 \
                     and parent['children_closed'] >= parent['children_total']:
                 parent['status'] = 'closed'
+                # Same in-place recycle hook as the normal SELL close path.
+                if self._recycle_in_place_enabled(strategy_name):
+                    self._recycle_ladder_in_place(strategy_name, parent)
         logger.info(f"[{strategy_name}] Recovery: merged SELL filled @ ${sell_price:.4f}, "
                    f"{len(children)} children closed (qty {executed_qty:.6f})")
         # Recovery cycle complete — clear pool so the next drawdown starts fresh.
@@ -1322,19 +1426,42 @@ class OrderManager:
                    f"target coin gain +{expected_gain:.6f})")
         return order
 
-    def _record_buyback_fill(self, strategy_name, sell_ladder, sold_qty, bought_qty):
-        """Update accumulation stats after a BUY_BACK fills."""
+    def _record_buyback_fill(self, strategy_name, sell_ladder, sold_qty, bought_qty,
+                             sold_price=0.0, bought_price=0.0):
+        """Update accumulation stats after a BUY_BACK fills.
+
+        Reports both axes of profit on every cycle:
+          - coin_gain  = bought_qty - sold_qty   (extra ZEC kept per cycle)
+          - usdt_gain  = sold_qty*sold_price - bought_qty*bought_price
+                         (extra USDT kept; positive whenever sell_price >
+                         buyback_price, even when coin_gain rounds to 0)
+
+        With small lots, step_size rounding usually pulls bought_qty back to
+        sold_qty so coin_gain prints as 0. The USDT gain stays positive,
+        which is the real profit captured by the accumulation leg.
+        """
         stats = self._accumulation_stats.setdefault(strategy_name, {
-            'coin_gain_total': 0.0, 'cycles_completed': 0,
+            'coin_gain_total': 0.0,
+            'cycles_completed': 0,
+            'usdt_gain_total': 0.0,
         })
-        gain = bought_qty - sold_qty
-        stats['coin_gain_total'] += gain
+        # Backfill for old state files written before usdt tracking existed.
+        stats.setdefault('usdt_gain_total', 0.0)
+        coin_gain = bought_qty - sold_qty
+        usdt_gain = (sold_qty * sold_price) - (bought_qty * bought_price)
+        stats['coin_gain_total'] += coin_gain
+        stats['usdt_gain_total'] += usdt_gain
         stats['cycles_completed'] += 1
         sell_ladder['status'] = 'closed'
-        sell_ladder['last_coin_gain'] = gain
-        logger.info(f"[{strategy_name}] Accumulation cycle #{stats['cycles_completed']} "
-                   f"complete: sold {sold_qty:.6f} → bought {bought_qty:.6f} "
-                   f"(gain +{gain:.6f}, cumulative +{stats['coin_gain_total']:.6f})")
+        sell_ladder['last_coin_gain'] = coin_gain
+        sell_ladder['last_usdt_gain'] = usdt_gain
+        logger.info(
+            f"[{strategy_name}] Accumulation cycle #{stats['cycles_completed']} "
+            f"complete: sold {sold_qty:.6f} @ ${sold_price:.4f} → "
+            f"bought {bought_qty:.6f} @ ${bought_price:.4f} | "
+            f"coin gain +{coin_gain:.6f} (cum +{stats['coin_gain_total']:.6f}) | "
+            f"usdt gain ${usdt_gain:+.4f} (cum ${stats['usdt_gain_total']:+.4f})"
+        )
 
     def reset_accumulation_state(self, strategy_name):
         """Clear accumulation state for a strategy (e.g. on full reset)."""
@@ -1437,10 +1564,26 @@ class OrderManager:
                         sell_ladder = order_data.get('sell_ladder') or {}
                         bought_qty = float(status.get('executedQty') or 0)
                         sold_qty = float(order_data.get('sold_qty') or 0)
+                        sold_price = float(order_data.get('sold_price') or 0)
+                        # Buyback's actual fill price (Binance returns the
+                        # limit price string in `price`).
+                        try:
+                            bought_price = float(status.get('price') or 0)
+                        except (TypeError, ValueError):
+                            bought_price = 0.0
                         self._record_buyback_fill(
                             order_data['strategy'], sell_ladder,
                             sold_qty=sold_qty, bought_qty=bought_qty,
+                            sold_price=sold_price, bought_price=bought_price,
                         )
+                        # Per-ladder recycle keeps the SELL leg of accumulation
+                        # active without dragging the BUY leg through a global
+                        # auto-restart (which would re-anchor the entire fib
+                        # tier to the new market price).
+                        if self._recycle_in_place_enabled(order_data.get('strategy')):
+                            self._recycle_sell_ladder_in_place(
+                                order_data['strategy'], sell_ladder
+                            )
 
                     elif otype == 'BUY':
                         self.portfolio.add_position(
@@ -1476,12 +1619,23 @@ class OrderManager:
                             parent['children_closed'] = parent.get('children_closed', 0) + 1
                             # Mark the whole ladder closed only when every child
                             # has completed its cycle.
+                            ladder_just_closed = False
                             if parent.get('children_total', 0) > 0 \
                                     and parent['children_closed'] >= parent['children_total']:
                                 parent['status'] = 'closed'
+                                ladder_just_closed = True
                             tag = "Child SELL" if otype == 'SELL' else "Recovery SELL"
                             logger.info(f"{tag} filled: "
                                        f"L{order_data['level']}.{child['idx']}")
+                            # Per-ladder recycle: when this fill closed the
+                            # whole ladder, immediately re-arm it at the same
+                            # prices so the level keeps cycling without the
+                            # global auto-restart re-anchoring everything.
+                            if ladder_just_closed and self._recycle_in_place_enabled(
+                                    order_data.get('strategy')):
+                                self._recycle_ladder_in_place(
+                                    order_data['strategy'], parent
+                                )
                             if otype == 'SELL_RECOVERY':
                                 # Drop from per-strategy recovery lot too.
                                 self._drop_from_recovery_lot(

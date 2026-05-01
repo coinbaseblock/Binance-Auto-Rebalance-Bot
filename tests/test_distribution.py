@@ -791,3 +791,269 @@ class TestStaleBuyRecycle:
             assert second == 0, "second scan within throttle window must be a no-op"
         finally:
             os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# Per-ladder in-place recycle
+# ---------------------------------------------------------------------------
+
+def _recycle_strategy_path(recycle_in_place=True):
+    """Distribution strategy with per-ladder in-place recycle enabled."""
+    cfg = {
+        "enabled": True,
+        "name": "ZEC Recycle Test",
+        "pair": "ZECUSDT",
+        "description": "per-ladder recycle test",
+        "ladder_config": {
+            "base_gap": 0.04,
+            "gap_max": 0.60,
+            "ladders": 8,
+            "fibonacci": [1, 1, 2, 3, 5, 8, 13, 21],
+            "size_mode": "fibonacci",
+            "unit_size_zec": 0.5,
+        },
+        "capital_allocation": {"max_allocation_percent": 1.0, "reserve_percent": 0.10},
+        "risk_management": {"safety_multiplier": 1.5, "stop_loss_percent": -0.50,
+                            "take_profit_percent": 0.25},
+        "execution": {"auto_rebalance": True, "rebalance_interval_hours": 12,
+                      "min_profit_to_close": 0.005},
+        "order_placement": {
+            "mode": "distribution",
+            "child_order_usdt": 25.0,
+            "proximity_percent": 0.015,
+            "max_open_orders_cap": 180,
+            "min_children_per_ladder": 1,
+            "max_children_per_ladder": 12,
+            "spread_mode": "geometric",
+            "child_profit_percent": 0.005,
+            "child_sell_mode": "min_of_both",
+            "recycle_in_place": recycle_in_place,
+        },
+    }
+    f = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+    json.dump(cfg, f)
+    f.close()
+    return f.name
+
+
+class TestLadderRecycleInPlace:
+    def test_closing_a_ladder_re_arms_it_at_original_prices(self):
+        """When all children of a ladder close, the ladder is reset to
+        pending and its children re-enter the queue at the SAME prices —
+        no re-anchoring to current market."""
+        path = _recycle_strategy_path(recycle_in_place=True)
+        try:
+            s = Strategy(path)
+            s.update_prices(380.0)
+            client = _NotionalFakeClient(min_notional=5.0)
+            om = OrderManager(client, Portfolio(5000.0))
+            om.register_strategies([s])
+            om.prime_distribution_queue(s)
+
+            # Mark L-1 as fully closed (its only child closed). It's a
+            # 1-child ladder so children_total=1, children_closed=1.
+            ladder = s.ladders[0]
+            original_buy = ladder['buy_price']
+            original_sell = ladder['sell_price']
+            ladder['status'] = 'closed'
+            ladder['children_total'] = 1
+            ladder['children_closed'] = 1
+            ladder['children_placed'] = 1
+
+            om._recycle_ladder_in_place(s.config['name'], ladder)
+
+            assert ladder['status'] == 'pending'
+            assert ladder['children_closed'] == 0
+            assert ladder['children_placed'] == 0
+            # Re-armed at the SAME prices — no shift
+            assert ladder['buy_price'] == original_buy
+            assert ladder['sell_price'] == original_sell
+            # Children re-entered the queue at the original price range
+            queue = om._pending_children[s.config['name']]
+            re_armed = [c for c in queue if c.get('parent_level') == ladder['level']]
+            assert len(re_armed) >= 1
+            top = max(c['buy_price'] for c in re_armed)
+            # Top child of the recycled ladder must be at (or just below)
+            # the ladder's original buy_price — confirms no re-anchoring.
+            assert top == pytest.approx(original_buy, rel=0.01)
+
+        finally:
+            os.unlink(path)
+
+    def test_recycle_no_op_when_disabled(self):
+        """recycle_in_place=false ⇒ helper is callable but the close-time
+        hook never invokes it; the ladder stays 'closed'."""
+        path = _recycle_strategy_path(recycle_in_place=False)
+        try:
+            s = Strategy(path)
+            s.update_prices(380.0)
+            client = _NotionalFakeClient(min_notional=5.0)
+            om = OrderManager(client, Portfolio(5000.0))
+            om.register_strategies([s])
+
+            assert om._recycle_in_place_enabled(s.config['name']) is False
+            assert om._recycle_in_place_enabled(s) is False
+
+        finally:
+            os.unlink(path)
+
+    def test_recycle_skips_when_strategy_unregistered(self):
+        """Defensive: recycle helper bails if it can't resolve the strategy."""
+        path = _recycle_strategy_path(recycle_in_place=True)
+        try:
+            s = Strategy(path)
+            s.update_prices(380.0)
+            client = _NotionalFakeClient(min_notional=5.0)
+            om = OrderManager(client, Portfolio(5000.0))
+            # NOTE: register_strategies NOT called.
+
+            ladder = s.ladders[0]
+            ladder['status'] = 'closed'
+            ladder['children_total'] = 1
+            ladder['children_closed'] = 1
+            om._recycle_ladder_in_place(s.config['name'], ladder)
+            # Without registration the helper just no-ops (does NOT crash).
+            assert ladder['status'] == 'closed'
+
+        finally:
+            os.unlink(path)
+
+    def test_recycle_only_acts_on_closed_ladders(self):
+        """Recycle helper is a no-op when the ladder isn't fully closed —
+        prevents accidental double-arming."""
+        path = _recycle_strategy_path(recycle_in_place=True)
+        try:
+            s = Strategy(path)
+            s.update_prices(380.0)
+            client = _NotionalFakeClient(min_notional=5.0)
+            om = OrderManager(client, Portfolio(5000.0))
+            om.register_strategies([s])
+
+            ladder = s.ladders[0]
+            ladder['status'] = 'pending'  # not closed
+            queue_before = len(om._pending_children.get(s.config['name'], []))
+            om._recycle_ladder_in_place(s.config['name'], ladder)
+            queue_after = len(om._pending_children.get(s.config['name'], []))
+            assert queue_after == queue_before, "non-closed ladder must not re-add children"
+
+        finally:
+            os.unlink(path)
+
+    def test_recycle_sell_ladder_resets_to_pending(self):
+        """Sell-ladder recycle just flips status back to pending so the
+        next loop tick re-promotes the SELL when price approaches."""
+        path = _recycle_strategy_path(recycle_in_place=True)
+        try:
+            s = Strategy(path)
+            s.update_prices(380.0)
+            client = _NotionalFakeClient(min_notional=5.0)
+            om = OrderManager(client, Portfolio(5000.0))
+            om.register_strategies([s])
+
+            sell_ladder = {
+                'level': 1,
+                'status': 'closed',
+                'sell_price': 390.0,
+                'filled_qty': 0.04,
+                'filled_price': 390.0,
+            }
+            om._recycle_sell_ladder_in_place(s.config['name'], sell_ladder)
+            assert sell_ladder['status'] == 'pending'
+            assert 'filled_qty' not in sell_ladder
+            assert 'filled_price' not in sell_ladder
+
+        finally:
+            os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# Accumulation USDT-gain reporting
+# ---------------------------------------------------------------------------
+
+class TestAccumulationUsdtGain:
+    def test_buyback_fill_records_both_coin_and_usdt_gain(self):
+        """Even when coin_gain rounds to 0 (small lots), the USDT gain
+        captured by sell-high/buy-low must still be recorded."""
+        path = _recycle_strategy_path()
+        try:
+            s = Strategy(path)
+            s.update_prices(380.0)
+            client = _NotionalFakeClient(min_notional=5.0)
+            om = OrderManager(client, Portfolio(5000.0))
+            om.register_strategies([s])
+
+            sell_ladder = {'level': 1, 'status': 'awaiting_buyback'}
+            # Sold 0.04 @ $386.62; buyback fills 0.04 @ $384.69 (coin gain
+            # rounds to 0, but USDT gain = 0.04*(386.62 - 384.69) = $0.0772)
+            om._record_buyback_fill(
+                strategy_name=s.config['name'],
+                sell_ladder=sell_ladder,
+                sold_qty=0.04, bought_qty=0.04,
+                sold_price=386.62, bought_price=384.69,
+            )
+            stats = om._accumulation_stats[s.config['name']]
+            assert stats['cycles_completed'] == 1
+            assert stats['coin_gain_total'] == pytest.approx(0.0)
+            assert stats['usdt_gain_total'] == pytest.approx(0.04 * (386.62 - 384.69))
+            assert sell_ladder['last_usdt_gain'] == pytest.approx(0.04 * (386.62 - 384.69))
+
+        finally:
+            os.unlink(path)
+
+    def test_usdt_gain_accumulates_across_cycles(self):
+        """Multiple cycles compound into the cumulative usdt_gain_total."""
+        path = _recycle_strategy_path()
+        try:
+            s = Strategy(path)
+            s.update_prices(380.0)
+            client = _NotionalFakeClient(min_notional=5.0)
+            om = OrderManager(client, Portfolio(5000.0))
+            om.register_strategies([s])
+            sl1 = {'level': 1, 'status': 'awaiting_buyback'}
+            sl2 = {'level': 2, 'status': 'awaiting_buyback'}
+            om._record_buyback_fill(
+                s.config['name'], sl1,
+                sold_qty=0.04, bought_qty=0.04,
+                sold_price=386.62, bought_price=384.69,
+            )
+            om._record_buyback_fill(
+                s.config['name'], sl2,
+                sold_qty=0.04, bought_qty=0.04,
+                sold_price=388.16, bought_price=386.22,
+            )
+            stats = om._accumulation_stats[s.config['name']]
+            assert stats['cycles_completed'] == 2
+            expected = 0.04 * ((386.62 - 384.69) + (388.16 - 386.22))
+            assert stats['usdt_gain_total'] == pytest.approx(expected)
+
+        finally:
+            os.unlink(path)
+
+    def test_legacy_state_without_usdt_gain_total_loads_cleanly(self):
+        """An accumulation_stats dict from before the USDT-gain field
+        existed must still accept new buyback fills without KeyError."""
+        path = _recycle_strategy_path()
+        try:
+            s = Strategy(path)
+            s.update_prices(380.0)
+            client = _NotionalFakeClient(min_notional=5.0)
+            om = OrderManager(client, Portfolio(5000.0))
+            om.register_strategies([s])
+            # Simulate a state file written before usdt_gain_total existed:
+            om._accumulation_stats[s.config['name']] = {
+                'coin_gain_total': 0.001, 'cycles_completed': 5,
+            }
+            sl = {'level': 1, 'status': 'awaiting_buyback'}
+            om._record_buyback_fill(
+                s.config['name'], sl,
+                sold_qty=0.04, bought_qty=0.04,
+                sold_price=386.62, bought_price=384.69,
+            )
+            stats = om._accumulation_stats[s.config['name']]
+            assert stats['cycles_completed'] == 6
+            assert stats['usdt_gain_total'] == pytest.approx(
+                0.04 * (386.62 - 384.69)
+            )
+
+        finally:
+            os.unlink(path)

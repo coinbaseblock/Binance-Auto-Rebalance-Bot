@@ -2,7 +2,7 @@
   "enabled": true,
   "name": "ZEC Distribution 5K + Micro",
   "pair": "ZECUSDT",
-  "description": "Hybrid two-tier ladder + SELL-side coin accumulation. BUY side: 4 micro ladders (0.4-1.6% below) for 'always trading' feel + 8 fibonacci ladders (4-60% below) — fib tier uses size_mode=fibonacci so unit multipliers match the configured [1,1,2,3,5,8,13,21] sequence (true fib martingale; reachable on $4-5K capital, unlike the legacy 2^i doubling). SELL side mirrors the same shape above market. Each SELL auto-pairs with a BUY-back at sell_price/(1+coin_profit_percent), guaranteeing ~0.5% more coins back per round-trip. Stale BUYs (>4h old AND >4% below market) are auto-recycled so the open-order cap doesn't wedge out closer placements.",
+  "description": "Hybrid two-tier ladder + SELL-side coin accumulation. BUY side: 4 micro ladders (0.4-1.6% below) for 'always trading' feel + 8 fibonacci ladders (4-60% below) — fib tier uses size_mode=fibonacci so unit multipliers match [1,1,2,3,5,8,13,21] (reachable on $4-6K capital). SELL side mirrors the same shape above market and auto-pairs each SELL with a BUY-back at sell_price/(1+coin_profit_percent). recycle_in_place=true makes each ladder re-arm AT ITS ORIGINAL PRICES the moment it closes, so closing the micro tier doesn't drag the fib tier through a global auto-restart that would re-anchor every level to a new market price (which would discard the whole fib plan). Accum micro unit bumped to 0.08 ZEC so coin_profit_percent (0.5%) clears step_size 0.001 and shows real coin gain instead of always rounding to 0. Stale BUYs (>4h old AND >4% below market) are auto-recycled to free up cap slots.",
 
   "ladder_config": {
     "base_gap": 0.04,
@@ -27,9 +27,9 @@
     "ladders": 8,
     "fibonacci": [1, 1, 2, 3, 5, 8, 13, 21],
     "size_mode": "fibonacci",
-    "unit_size_zec": 0.05,
+    "unit_size_zec": 0.08,
     "coin_profit_percent": 0.005,
-    "proximity_percent": 0.006,
+    "proximity_percent": 0.015,
     "max_open_sells_cap": 30,
     "reserve_coin_percent": 0.05,
     "micro_layer": {
@@ -37,7 +37,7 @@
       "count": 4,
       "gap": 0.004,
       "fibonacci": [1, 1, 2, 3],
-      "unit_size_zec": 0.04
+      "unit_size_zec": 0.08
     }
   },
 
@@ -61,13 +61,14 @@
   "order_placement": {
     "mode": "distribution",
     "child_order_usdt": 12.0,
-    "proximity_percent": 0.006,
+    "proximity_percent": 0.015,
     "max_open_orders_cap": 220,
     "min_children_per_ladder": 1,
     "max_children_per_ladder": 16,
     "spread_mode": "geometric",
     "child_profit_percent": 0.005,
     "child_sell_mode": "min_of_both",
+    "recycle_in_place": true,
     "stale_buy_max_age_seconds": 14400,
     "stale_buy_distance_threshold": 0.04,
     "stale_buy_check_interval_seconds": 600

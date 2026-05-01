@@ -156,6 +156,7 @@ def run_live_trading(args):
 
     # Load strategies
     strategies = load_strategies(args.strategies)
+    order_manager.register_strategies(strategies)
 
     if resuming:
         logger.info(f"=== RESUMING SESSION from {state_path} ===")
@@ -595,6 +596,7 @@ def run_dashboard(args):
 
         # Load strategies
         strategies = load_strategies(args.strategies)
+        order_manager.register_strategies(strategies)
 
         # Initialize strategies with current prices
         for strategy in strategies:
