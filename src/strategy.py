@@ -440,6 +440,12 @@ class Strategy:
             'proximity_percent': float(accum.get('proximity_percent', 0.006)),
             'max_open_sells_cap': int(accum.get('max_open_sells_cap', 30)),
             'reserve_coin_percent': float(accum.get('reserve_coin_percent', 0.05)),
+            # When coin balance is insufficient, wait this long for a dip /
+            # upstream BUYs to refill before downsizing the SELL.
+            'wait_for_balance_seconds': float(accum.get('wait_for_balance_seconds', 600)),
+            # If True, after the wait window elapses, place a SELL sized to
+            # the actually-available balance (subject to LOT_SIZE / NOTIONAL).
+            'allow_partial_after_wait': bool(accum.get('allow_partial_after_wait', True)),
         }
 
     def get_pending_sell_ladders(self):
