@@ -1290,11 +1290,13 @@ class OrderManager:
         return placed
 
     def _place_accumulation_sell(self, strategy, ladder):
-        """Place one SELL_ACCUM order; raise on insufficient coin balance.
+        """Place one SELL_ACCUM order.
 
-        Per spec: if we don't have enough coins to honour the SELL, surface
-        a clear error rather than silently skipping (the user explicitly
-        asked for "ขายไม่ได้ให้ขึ้น error และลง log").
+        Insufficient coin balance no longer crashes the bot. Instead we mark
+        the ladder as waiting and retry on subsequent cycles. If the wait
+        exceeds `wait_for_balance_seconds`, we downsize the order to the
+        coins actually available (subject to LOT_SIZE / NOTIONAL filters)
+        so the bot can still participate in the move rather than miss it.
         """
         strategy_name = strategy.config['name']
         symbol = strategy.config['pair']
@@ -1313,14 +1315,63 @@ class OrderManager:
         accum_cfg = strategy.get_accumulation_config()
         reserve = accum_cfg['reserve_coin_percent']
         usable = available * (1.0 - reserve)
+        wait_seconds = accum_cfg.get('wait_for_balance_seconds', 600)
+        allow_partial = accum_cfg.get('allow_partial_after_wait', True)
 
+        downsized = False
         if coin_amount > usable:
-            msg = (f"[{strategy_name}] INSUFFICIENT {base_asset} BALANCE for SELL accum "
-                   f"Lvl +{ladder['level']}: need {coin_amount:.6f} {base_asset} "
-                   f"(reserve {reserve:.0%}, usable {usable:.6f} of {available:.6f}). "
-                   f"Deposit more {base_asset} or reduce accumulation.unit_size_zec.")
-            logger.error(msg)
-            raise RuntimeError(msg)
+            now = time.time()
+            waiting_since = ladder.get('waiting_since')
+            if waiting_since is None:
+                ladder['waiting_since'] = now
+                waiting_since = now
+            elapsed = now - waiting_since
+
+            # Throttle the warning so logs don't spam every poll.
+            warn_state = self._insufficient_balance_warned.setdefault(strategy_name, {})
+            last_warn = warn_state.get(ladder['level'], 0)
+            if now - last_warn >= 60:
+                logger.warning(
+                    f"[{strategy_name}] Waiting for {base_asset} balance for SELL accum "
+                    f"Lvl +{ladder['level']}: need {coin_amount:.6f}, usable "
+                    f"{usable:.6f} of {available:.6f} (reserve {reserve:.0%}). "
+                    f"Waited {elapsed:.0f}s / {wait_seconds:.0f}s before adjusting."
+                )
+                warn_state[ladder['level']] = now
+
+            if not allow_partial or elapsed < wait_seconds:
+                # Still inside the grace window — keep waiting for a dip /
+                # for upstream BUYs to fill and replenish the coin balance.
+                return None
+
+            # Grace window elapsed: downsize to what's actually available so
+            # the bot doesn't sit out the entire move. Respect step_size and
+            # min_notional; if neither fits, defer for another cycle.
+            try:
+                filters = self.client.get_symbol_filters(symbol)
+                step_size = filters.get('step_size', '0.001')
+                min_qty = float(filters.get('min_qty', 0) or 0)
+                min_notional = float(filters.get('min_notional', 0) or 0)
+            except Exception as e:
+                logger.error(f"[{strategy_name}] Cannot fetch filters for partial SELL: {e}")
+                return None
+
+            adjusted_qty = float(self.client._round_to_step(usable, step_size))
+            if adjusted_qty <= 0 or adjusted_qty < min_qty or adjusted_qty * sell_price < min_notional:
+                logger.warning(
+                    f"[{strategy_name}] Lvl +{ladder['level']}: usable balance "
+                    f"{usable:.6f} {base_asset} too small to place a partial SELL "
+                    f"(min_qty={min_qty}, min_notional=${min_notional:.2f}). Continuing to wait."
+                )
+                return None
+
+            logger.warning(
+                f"[{strategy_name}] Lvl +{ladder['level']}: downsizing SELL from "
+                f"{coin_amount:.6f} to {adjusted_qty:.6f} {base_asset} after waiting "
+                f"{elapsed:.0f}s for balance."
+            )
+            coin_amount = adjusted_qty
+            downsized = True
 
         ok, reason = self.client.check_percent_price_filter(symbol, 'SELL', sell_price)
         if not ok:
@@ -1344,8 +1395,16 @@ class OrderManager:
             'sell_ladder': ladder,
         }
         ladder['status'] = 'placed'
+        if downsized:
+            # Record so buyback sizing reflects what we actually sold.
+            ladder['placed_coin_amount'] = coin_amount
+        ladder.pop('waiting_since', None)
+        warn_state = self._insufficient_balance_warned.get(strategy_name)
+        if warn_state is not None:
+            warn_state.pop(ladder['level'], None)
         logger.info(f"[{strategy_name}] Accum SELL placed: Lvl +{ladder['level']} "
-                   f"@ ${sell_price:.4f} qty={coin_amount:.6f} (target buyback "
+                   f"@ ${sell_price:.4f} qty={coin_amount:.6f}"
+                   f"{' [partial]' if downsized else ''} (target buyback "
                    f"@ ${ladder['buyback_price']:.4f}, +{strategy.get_accumulation_config()['coin_profit_percent']:.2%} coins)")
         return order
 
