@@ -37,7 +37,10 @@ class BinanceClient:
         if not api_key or not api_secret:
             raise ValueError("Binance API credentials not found in .env file")
 
-        self.client = Client(api_key, api_secret, testnet=testnet)
+        # Constructing the python-binance Client issues a /api/v3/ping which
+        # can fail on transient DNS/network glitches at startup. Retry with
+        # exponential backoff so a brief outage doesn't kill the process.
+        self.client = self._connect_with_retry(api_key, api_secret, testnet)
         self.testnet = testnet
         self._symbol_filters = {}  # Cache for symbol filter info
         self._price_cache = {}  # symbol -> (price, fetch_timestamp)
@@ -52,6 +55,27 @@ class BinanceClient:
             logger.warning(f"Initial time sync failed (will retry on demand): {e}")
 
         logger.info(f"Binance client initialized (testnet={testnet})")
+
+    def _connect_with_retry(self, api_key, api_secret, testnet, max_attempts=5):
+        delay = 2
+        last_err = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return Client(api_key, api_secret, testnet=testnet)
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout) as e:
+                last_err = e
+                if attempt == max_attempts:
+                    break
+                logger.warning(
+                    f"Network error connecting to Binance (attempt "
+                    f"{attempt}/{max_attempts}), retrying in {delay}s: {e}"
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+        raise ConnectionError(
+            f"Could not reach Binance API after {max_attempts} attempts: {last_err}"
+        )
 
     def _sync_time_offset(self):
         """Fetch Binance server time and store the offset on the underlying

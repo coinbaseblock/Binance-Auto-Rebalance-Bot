@@ -1259,8 +1259,18 @@ class OrderManager:
             and od.get('type') in ('SELL_ACCUM', 'BUY_BACK')
         )
 
+        # If any pending ladder is already waiting on balance (or marked
+        # stuck), don't promote ladders ABOVE it — they'd just queue up
+        # competing for the same insufficient balance and spam the log.
+        sorted_pending = sorted(pending, key=lambda l: l['sell_price'])
+        block_above_price = None
+        for l in sorted_pending:
+            if l.get('waiting_since') is not None or l.get('stuck_at_balance') is not None:
+                block_above_price = l['sell_price']
+                break
+
         placed = []
-        for ladder in sorted(pending, key=lambda l: l['sell_price']):
+        for ladder in sorted_pending:
             if active_accum >= cap:
                 logger.debug(f"[{strategy_name}] Accumulation cap ({cap}) reached, "
                              f"{len(pending) - len(placed)} sell ladders still pending")
@@ -1268,6 +1278,10 @@ class OrderManager:
 
             sell_price = ladder.get('sell_price', 0)
             if sell_price <= 0:
+                continue
+
+            if block_above_price is not None and sell_price > block_above_price:
+                # Lower ladder is still waiting on balance; defer higher ones.
                 continue
 
             # Promote when price is at/above sell price OR within proximity below it.
@@ -1288,6 +1302,19 @@ class OrderManager:
                 active_accum += 1
 
         return placed
+
+    def _clear_stuck_sell_ladders(self, strategy_name):
+        """Drop stuck-balance watermarks for a strategy's sell ladders.
+
+        Called after events that grow the coin balance (e.g. a BUY fill) so
+        the next placement cycle re-evaluates ladders that had been deferred.
+        """
+        strategy = self._strategy_by_name(strategy_name)
+        if strategy is None:
+            return
+        for ladder in getattr(strategy, 'sell_ladders', []) or []:
+            ladder.pop('stuck_at_balance', None)
+            ladder.pop('stuck_warned_at', None)
 
     def _place_accumulation_sell(self, strategy, ladder):
         """Place one SELL_ACCUM order.
@@ -1317,6 +1344,17 @@ class OrderManager:
         usable = available * (1.0 - reserve)
         wait_seconds = accum_cfg.get('wait_for_balance_seconds', 600)
         allow_partial = accum_cfg.get('allow_partial_after_wait', True)
+
+        # If this ladder was previously marked "stuck" (usable balance too
+        # small for even a partial SELL), stay silent until balance actually
+        # grows past the recorded watermark. Avoids flooding the log every
+        # poll while we wait for a BUY to refill the coin balance.
+        stuck_at = ladder.get('stuck_at_balance')
+        if stuck_at is not None and usable <= stuck_at + 1e-12:
+            return None
+        if stuck_at is not None and usable > stuck_at:
+            ladder.pop('stuck_at_balance', None)
+            ladder.pop('stuck_warned_at', None)
 
         downsized = False
         if coin_amount > usable:
@@ -1358,11 +1396,18 @@ class OrderManager:
 
             adjusted_qty = float(self.client._round_to_step(usable, step_size))
             if adjusted_qty <= 0 or adjusted_qty < min_qty or adjusted_qty * sell_price < min_notional:
-                logger.warning(
-                    f"[{strategy_name}] Lvl +{ladder['level']}: usable balance "
-                    f"{usable:.6f} {base_asset} too small to place a partial SELL "
-                    f"(min_qty={min_qty}, min_notional=${min_notional:.2f}). Continuing to wait."
-                )
+                # Mark the ladder as stuck so future polls stay silent until
+                # the balance actually grows (BUY fills clear this watermark
+                # via _clear_stuck_sell_ladders).
+                if ladder.get('stuck_at_balance') != usable:
+                    logger.warning(
+                        f"[{strategy_name}] Lvl +{ladder['level']}: usable balance "
+                        f"{usable:.6f} {base_asset} too small to place a partial SELL "
+                        f"(min_qty={min_qty}, min_notional=${min_notional:.2f}). "
+                        f"Deferring until balance grows."
+                    )
+                    ladder['stuck_at_balance'] = usable
+                    ladder['stuck_warned_at'] = now
                 return None
 
             logger.warning(
@@ -1399,6 +1444,8 @@ class OrderManager:
             # Record so buyback sizing reflects what we actually sold.
             ladder['placed_coin_amount'] = coin_amount
         ladder.pop('waiting_since', None)
+        ladder.pop('stuck_at_balance', None)
+        ladder.pop('stuck_warned_at', None)
         warn_state = self._insufficient_balance_warned.get(strategy_name)
         if warn_state is not None:
             warn_state.pop(ladder['level'], None)
@@ -1653,6 +1700,10 @@ class OrderManager:
                             cost=float(status['cummulativeQuoteQty'])
                         )
                         order_data['ladder']['status'] = 'active'
+
+                        # Coin balance just grew — let any sell ladders that
+                        # were marked stuck reassess on the next cycle.
+                        self._clear_stuck_sell_ladders(order_data['strategy'])
 
                         if child is not None:
                             logger.info(f"Child BUY filled: "
