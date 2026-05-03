@@ -448,6 +448,42 @@ class Strategy:
             'allow_partial_after_wait': bool(accum.get('allow_partial_after_wait', True)),
         }
 
+    def get_inventory_hoard_config(self):
+        """Return inventory-hoard config with defaults applied.
+
+        Inventory hoard is an optional micro-scalper layer that activates
+        only when the main accumulation SELL ladder cannot fill (coin
+        balance too small) AND price moves up past the stuck level. It
+        places small isolated BUY -> SELL round-trips using a separate
+        budget pool so the main BUY/SELL ladders are not affected.
+
+        Keys:
+          - enabled: master switch (default False)
+          - trigger_on_stuck_level: trigger only when SELL accum at this
+            level (or below) is marked stuck (default 1 — the closest one)
+          - trigger_price_above_pct: require current_price >= stuck
+            sell_price * (1 + this) before placing a hoard BUY
+          - hoard_budget_usdt: hard cap on USDT deployed across open hoard
+            BUYs simultaneously (does not draw from main capital tracking)
+          - child_order_usdt: notional per hoard BUY
+          - profit_percent: SELL = filled_buy_price * (1 + this)
+          - max_open_orders: max simultaneous hoard orders (BUY + SELL)
+          - max_per_hour: rate-limit on new hoard BUY placements
+          - cooldown_seconds: minimum gap between consecutive hoard BUYs
+        """
+        h = self.config.get('inventory_hoard') or {}
+        return {
+            'enabled': bool(h.get('enabled', False)),
+            'trigger_on_stuck_level': int(h.get('trigger_on_stuck_level', 1)),
+            'trigger_price_above_pct': float(h.get('trigger_price_above_pct', 0.003)),
+            'hoard_budget_usdt': float(h.get('hoard_budget_usdt', 50.0)),
+            'child_order_usdt': float(h.get('child_order_usdt', 6.0)),
+            'profit_percent': float(h.get('profit_percent', 0.007)),
+            'max_open_orders': int(h.get('max_open_orders', 3)),
+            'max_per_hour': int(h.get('max_per_hour', 5)),
+            'cooldown_seconds': float(h.get('cooldown_seconds', 90)),
+        }
+
     def get_pending_sell_ladders(self):
         """Get accumulation SELL ladders waiting to be triggered."""
         return [l for l in self.sell_ladders if l['status'] == 'pending']

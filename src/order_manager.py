@@ -45,6 +45,15 @@ class OrderManager:
         #     'cycles_completed': int,     # number of full SELL→BUY round-trips
         # }}
         self._accumulation_stats = {}
+        # Inventory hoard (mini-scalper) state — isolated from main ladders.
+        # {strategy_name: {
+        #     'budget_used_usdt': float,    # USDT currently locked in open hoard BUYs
+        #     'recent_buy_ts': [unix_ts],   # timestamps of recent hoard BUY placements
+        #     'last_buy_ts': float,         # cooldown anchor
+        # }}
+        self._hoard_state = {}
+        # {strategy_name: {coin_gain, usdt_gain, cycles}}
+        self._hoard_stats = {}
 
     def place_ladder_buy_orders(self, strategy, current_price):
         """Place buy orders for all pending ladders, respecting balance and exchange filters"""
@@ -1316,6 +1325,202 @@ class OrderManager:
             ladder.pop('stuck_at_balance', None)
             ladder.pop('stuck_warned_at', None)
 
+    # ------------------------------------------------------------------
+    # Inventory Hoard (mini-scalper) — isolated micro BUY -> SELL layer
+    # ------------------------------------------------------------------
+    def _hoard_get_state(self, strategy_name):
+        return self._hoard_state.setdefault(strategy_name, {
+            'budget_used_usdt': 0.0,
+            'recent_buy_ts': [],
+            'last_buy_ts': 0.0,
+        })
+
+    def _hoard_count_open(self, strategy_name):
+        return sum(
+            1 for od in self.active_orders.values()
+            if od.get('strategy') == strategy_name
+            and od.get('type') in ('HOARD_BUY', 'HOARD_SELL')
+        )
+
+    def _hoard_first_stuck_ladder(self, strategy, trigger_level):
+        """Return the lowest-level stuck SELL accum ladder at/below the trigger
+        threshold, or None."""
+        for ladder in getattr(strategy, 'sell_ladders', []) or []:
+            if ladder.get('level', 999) > trigger_level:
+                continue
+            if ladder.get('stuck_at_balance') is not None:
+                return ladder
+        return None
+
+    def tick_inventory_hoard(self, strategy, current_price):
+        """Place a micro hoard BUY when main SELL accum is stuck and price
+        has rallied past the stuck level. Fully isolated from the main
+        BUY/SELL ladders: separate budget, separate stats, separate tags.
+        """
+        cfg = strategy.get_inventory_hoard_config()
+        if not cfg['enabled']:
+            return None
+
+        stuck_ladder = self._hoard_first_stuck_ladder(strategy, cfg['trigger_on_stuck_level'])
+        if stuck_ladder is None:
+            return None
+
+        sell_price = float(stuck_ladder.get('sell_price') or 0)
+        if sell_price <= 0:
+            return None
+        threshold = sell_price * (1.0 + cfg['trigger_price_above_pct'])
+        if current_price < threshold:
+            return None
+
+        strategy_name = strategy.config['name']
+        state = self._hoard_get_state(strategy_name)
+        now = time.time()
+
+        # Cooldown
+        if now - state['last_buy_ts'] < cfg['cooldown_seconds']:
+            return None
+        # Open-order cap
+        if self._hoard_count_open(strategy_name) >= cfg['max_open_orders']:
+            return None
+        # Per-hour rate limit
+        state['recent_buy_ts'] = [t for t in state['recent_buy_ts'] if now - t < 3600]
+        if len(state['recent_buy_ts']) >= cfg['max_per_hour']:
+            return None
+        # Budget cap — recompute from live HOARD_BUY orders so that orders
+        # adopted from state on restart are accounted for correctly.
+        live_locked = sum(
+            float((od.get('hoard') or {}).get('locked_usdt') or 0.0)
+            for od in self.active_orders.values()
+            if od.get('strategy') == strategy_name and od.get('type') == 'HOARD_BUY'
+        )
+        state['budget_used_usdt'] = live_locked
+        order_usdt = cfg['child_order_usdt']
+        if state['budget_used_usdt'] + order_usdt > cfg['hoard_budget_usdt']:
+            return None
+
+        symbol = strategy.config['pair']
+        # Use a slightly aggressive limit BUY (just above current price) so
+        # it fills quickly without paying full taker on a market order. If
+        # price keeps running we miss this one — that's intended; we'll
+        # try again next tick after cooldown.
+        buy_price = current_price * 1.0005
+        qty = order_usdt / buy_price
+
+        try:
+            filters = self.client.get_symbol_filters(symbol)
+            min_qty = float(filters.get('min_qty', 0) or 0)
+            min_notional = float(filters.get('min_notional', 0) or 0)
+        except Exception as e:
+            logger.error(f"[{strategy_name}] hoard: cannot fetch filters: {e}")
+            return None
+
+        if qty < min_qty or qty * buy_price < min_notional:
+            logger.warning(
+                f"[{strategy_name}] hoard: child_order_usdt ${order_usdt:.2f} too small "
+                f"(min_qty={min_qty}, min_notional=${min_notional:.2f}). Skipping."
+            )
+            return None
+
+        ok, reason = self.client.check_percent_price_filter(symbol, 'BUY', buy_price)
+        if not ok:
+            logger.warning(f"[{strategy_name}] hoard BUY rejected by price filter: {reason}")
+            return None
+
+        try:
+            order = self.client.create_limit_order(
+                symbol=symbol, side='BUY', quantity=qty, price=buy_price,
+            )
+        except Exception as e:
+            logger.error(f"[{strategy_name}] hoard BUY failed: {e}")
+            return None
+
+        # Lock budget against the actual rounded notional we submitted.
+        actual_qty = float(order.get('origQty') or qty)
+        actual_price = float(order.get('price') or buy_price)
+        locked_usdt = actual_qty * actual_price
+
+        self.active_orders[order['orderId']] = {
+            'strategy': strategy_name,
+            'level': 'HOARD',
+            'type': 'HOARD_BUY',
+            'order': order,
+            'hoard': {
+                'buy_price': actual_price,
+                'qty': actual_qty,
+                'locked_usdt': locked_usdt,
+                'profit_percent': cfg['profit_percent'],
+                'trigger_sell_price': sell_price,
+            },
+        }
+        state['budget_used_usdt'] += locked_usdt
+        state['recent_buy_ts'].append(now)
+        state['last_buy_ts'] = now
+        logger.info(
+            f"[{strategy_name}] HOARD BUY placed: {actual_qty:.6f} @ ${actual_price:.4f} "
+            f"(stuck Lvl +{stuck_ladder.get('level')} @ ${sell_price:.4f}, "
+            f"price now ${current_price:.4f}, budget {state['budget_used_usdt']:.2f}/"
+            f"{cfg['hoard_budget_usdt']:.2f})"
+        )
+        return order
+
+    def _place_hoard_sell(self, strategy, hoard_meta, filled_qty, filled_price):
+        """Place the matching HOARD_SELL right after a HOARD_BUY fills."""
+        strategy_name = strategy.config['name']
+        symbol = strategy.config['pair']
+        profit = float(hoard_meta.get('profit_percent') or 0.007)
+        sell_price = filled_price * (1.0 + profit)
+
+        ok, reason = self.client.check_percent_price_filter(symbol, 'SELL', sell_price)
+        if not ok:
+            logger.warning(f"[{strategy_name}] HOARD SELL rejected by price filter: {reason}")
+            return None
+
+        try:
+            order = self.client.create_limit_order(
+                symbol=symbol, side='SELL', quantity=filled_qty, price=sell_price,
+            )
+        except Exception as e:
+            logger.error(f"[{strategy_name}] HOARD SELL failed: {e}")
+            return None
+
+        self.active_orders[order['orderId']] = {
+            'strategy': strategy_name,
+            'level': 'HOARD',
+            'type': 'HOARD_SELL',
+            'order': order,
+            'hoard': {
+                'buy_price': filled_price,
+                'sell_price': sell_price,
+                'qty': filled_qty,
+                'profit_percent': profit,
+            },
+        }
+        logger.info(
+            f"[{strategy_name}] HOARD SELL placed: {filled_qty:.6f} @ ${sell_price:.4f} "
+            f"(target +{profit:.2%} from ${filled_price:.4f})"
+        )
+        return order
+
+    def _record_hoard_cycle(self, strategy_name, hoard_meta, sold_qty, sold_price):
+        """Record completed HOARD round-trip and free its budget slot."""
+        buy_price = float(hoard_meta.get('buy_price') or 0)
+        usdt_gain = (sold_price - buy_price) * sold_qty
+        stats = self._hoard_stats.setdefault(strategy_name, {
+            'usdt_gain_total': 0.0, 'cycles_completed': 0,
+        })
+        stats['usdt_gain_total'] += usdt_gain
+        stats['cycles_completed'] += 1
+        # Free budget that was locked at BUY time. Use the original locked
+        # notional if available; fall back to current sold notional.
+        state = self._hoard_get_state(strategy_name)
+        locked = float(hoard_meta.get('locked_usdt') or buy_price * sold_qty)
+        state['budget_used_usdt'] = max(0.0, state['budget_used_usdt'] - locked)
+        logger.info(
+            f"[{strategy_name}] HOARD cycle done: +${usdt_gain:.4f} "
+            f"(buy ${buy_price:.4f} -> sell ${sold_price:.4f}, qty {sold_qty:.6f}). "
+            f"Total: ${stats['usdt_gain_total']:.4f} over {stats['cycles_completed']} cycles."
+        )
+
     def _place_accumulation_sell(self, strategy, ladder):
         """Place one SELL_ACCUM order.
 
@@ -1640,7 +1845,7 @@ class OrderManager:
                     # bookkeeping so multiple children per ladder don't collide.
                     if otype == 'SELL_MERGED':
                         position_level = None  # handled by _handle_merged_sell_fill
-                    elif otype in ('SELL_ACCUM', 'BUY_BACK'):
+                    elif otype in ('SELL_ACCUM', 'BUY_BACK', 'HOARD_BUY', 'HOARD_SELL'):
                         position_level = None  # handled inline below
                     else:
                         position_level = (
@@ -1690,6 +1895,39 @@ class OrderManager:
                             self._recycle_sell_ladder_in_place(
                                 order_data['strategy'], sell_ladder
                             )
+
+                    elif otype == 'HOARD_BUY':
+                        hoard_meta = order_data.get('hoard') or {}
+                        filled_price = float(status.get('price') or hoard_meta.get('buy_price') or 0)
+                        filled_qty = float(status.get('executedQty') or hoard_meta.get('qty') or 0)
+                        hoard_meta['filled_price'] = filled_price
+                        hoard_meta['filled_qty'] = filled_qty
+                        logger.info(
+                            f"[{order_data['strategy']}] HOARD BUY filled: "
+                            f"{filled_qty:.6f} @ ${filled_price:.4f}"
+                        )
+                        # Place HOARD_SELL synchronously so the new coins are
+                        # locked on the exchange before the main accumulation
+                        # tick can sweep them into a SELL_ACCUM.
+                        strat = self._strategy_by_name(order_data['strategy'])
+                        if strat is not None:
+                            self._place_hoard_sell(
+                                strat, hoard_meta,
+                                filled_qty=filled_qty,
+                                filled_price=filled_price,
+                            )
+
+                    elif otype == 'HOARD_SELL':
+                        hoard_meta = order_data.get('hoard') or {}
+                        filled_qty = float(status.get('executedQty') or hoard_meta.get('qty') or 0)
+                        try:
+                            filled_price = float(status.get('price') or hoard_meta.get('sell_price') or 0)
+                        except (TypeError, ValueError):
+                            filled_price = float(hoard_meta.get('sell_price') or 0)
+                        self._record_hoard_cycle(
+                            order_data['strategy'], hoard_meta,
+                            sold_qty=filled_qty, sold_price=filled_price,
+                        )
 
                     elif otype == 'BUY':
                         self.portfolio.add_position(

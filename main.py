@@ -402,6 +402,13 @@ def run_live_trading(args):
                                 # Insufficient coin balance: surfaced loudly,
                                 # don't kill the loop — let user fix wallet.
                                 logger.error(f"Accumulation halted: {e}")
+                        # Inventory hoard (mini-scalper): only fires when a
+                        # main SELL accum ladder is stuck AND price has
+                        # rallied past it. Isolated budget, separate stats.
+                        try:
+                            order_manager.tick_inventory_hoard(strategy, cp)
+                        except Exception as e:
+                            logger.error(f"Inventory hoard tick failed: {e}")
                         # Recovery scan: roll any far-from-market SELLs into the
                         # merged recovery lot so they don't sit unfillable, and
                         # ensure a merged SELL exists whenever the lot has

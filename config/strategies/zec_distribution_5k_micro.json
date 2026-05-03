@@ -41,6 +41,18 @@
     }
   },
 
+  "inventory_hoard": {
+    "enabled": true,
+    "trigger_on_stuck_level": 1,
+    "trigger_price_above_pct": 0.003,
+    "hoard_budget_usdt": 50.0,
+    "child_order_usdt": 6.0,
+    "profit_percent": 0.007,
+    "max_open_orders": 3,
+    "max_per_hour": 5,
+    "cooldown_seconds": 90
+  },
+
   "capital_allocation": {
     "max_allocation_percent": 1.0,
     "reserve_percent": 0.10
