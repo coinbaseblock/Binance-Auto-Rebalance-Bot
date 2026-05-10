@@ -6,7 +6,7 @@ REM
 REM Usage:
 REM   scripts\build-binaries.bat                 :: build all targets
 REM   scripts\build-binaries.bat linux/amd64
-REM   scripts\build-binaries.bat linux/arm64 windows/amd64
+REM   scripts\build-binaries.bat linux/arm64 windows/amd64 windows/arm64
 REM
 REM Requirements:
 REM   - Docker Desktop (with buildx)
@@ -18,7 +18,7 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0\.."
 
 set "TARGETS=%*"
-if "%TARGETS%"=="" set "TARGETS=windows/amd64 linux/amd64 linux/arm64"
+if "%TARGETS%"=="" set "TARGETS=windows/amd64 windows/arm64 linux/amd64 linux/arm64"
 
 where docker >nul 2>&1 || (echo [err] docker not on PATH & exit /b 1)
 docker buildx version >nul 2>&1 || (echo [err] docker buildx missing & exit /b 1)
@@ -37,6 +37,7 @@ for %%T in (%TARGETS%) do (
     if /i "%%T"=="linux/amd64"   call :build_linux amd64
     if /i "%%T"=="linux/arm64"   call :build_linux arm64
     if /i "%%T"=="windows/amd64" call :build_windows amd64
+    if /i "%%T"=="windows/arm64" call :build_windows arm64
 )
 
 echo.
@@ -61,7 +62,7 @@ set "OUT=dist\_tmp-windows-%ARCH%"
 echo.
 echo ==^> Building windows/%ARCH% -^> dist\binance-bot-windows-%ARCH%.exe
 if exist "%OUT%" rmdir /s /q "%OUT%"
-docker buildx build --platform linux/amd64 -f Dockerfile.binary.windows -o "type=local,dest=%OUT%" . || exit /b 1
+docker buildx build --platform linux/%ARCH% -f Dockerfile.binary.windows -o "type=local,dest=%OUT%" . || exit /b 1
 move /y "%OUT%\binance-bot.exe" "dist\binance-bot-windows-%ARCH%.exe" >nul
 rmdir /s /q "%OUT%"
 goto :eof
